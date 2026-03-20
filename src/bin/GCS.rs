@@ -1,475 +1,735 @@
-// GROUND CONTROL STATION - BY CHONG CHUN KIT (TP077436)
-// SOFT RTS
-
 // =============================================================================
 //  src/bin/GCS.rs   —   Ground Control Station (GCS)
 //  CT087-3-3 Real-Time Systems  |  Student B
 //
 //  Run:   cargo run --bin GCS --release
+//         (start OCS first — it binds UDP ports before GCS connects)
 //
-//  Architecture: Soft Real-Time System on Tokio cooperative multitasking.
-//  Communicates with the OCS exclusively via MQTT (the IPC channel).
+//  ARCHITECTURE OVERVIEW:
+//  This is a SOFT Real-Time System built on Tokio (async/await).
+//  As covered in Lab 6, async tasks are ideal for I/O-heavy workloads
+//  with soft deadlines. GCS has soft deadlines (3ms decode, 2ms dispatch)
+//  and spends most of its time waiting on network I/O — async is the right fit.
 //
-//  Tutorial map — every major pattern traced to its source lab:
+//  IPC (Inter-Process Communication):
+//    GCS listens for OCS telemetry on   0.0.0.0:9000
+//    GCS sends commands to OCS at       127.0.0.1:9001
+//
+//  SERDE / SERDE_JSON:
+//  Incoming OCS payloads are deserialised with serde_json::from_str::<OcsMsg>().
+//  Outgoing GCS commands are serialised with serde_json::to_string(&GcsCmd{}).
+//  Both types share the same wire format with OCS.
+//
+//  LAB REFERENCE MAP:
 //  ─────────────────────────────────────────────────────────────
-//  Lab 1  const, structs, enums, match, Vec, for, mut
-//  Lab 2  Arc<Mutex<T>>, Arc::clone(), jitter / drift formula
+//  Lab 1  const, structs, enums, match, Vec, mut
+//  Lab 2  Arc<Mutex<T>>, Arc::clone()
 //  Lab 3  Instant::now() + .elapsed(), min/max/avg stat helper
-//  Lab 6  #[tokio::main], tokio::spawn, sleep().await
-//  Lab 7  enum error variants + #[derive(Debug)], match arms,
-//         consecutive-miss counter that resets on success
+//  Lab 6  #[tokio::main], tokio::spawn, sleep().await, heartbeat,
+//         spawn_blocking — CPU decode offloaded from async runtime
+//  Lab 7  PhantomData<S> typestate: GcsMode<Normal>/GcsMode<FaultLocked>
+//         dispatch_command() only compiles with GcsMode<Normal>
+//         enum OcsFaultKind + match, consecutive-miss counter reset
 //  Lab 8  tokio::select!, CancellationToken, supervisor restart loop,
-//         fragile uplink + match handle.await { Err(e) if e.is_panic() }
-//  Lab 9  MqttOptions::new, AsyncClient::new, eventloop.poll() spawn,
-//         client.subscribe(), client.publish() for command uplink
-//  Lab 11 Arc<Mutex<Vec>> command queue (job-queue pattern),
-//         mpsc channel for MQTT-to-decoder pipeline
+//         fragile task + match handle.await { Err(e) if e.is_panic() }
+//  Lab 9  tokio::net::UdpSocket — recv_from / send_to (async)
+//  Lab 11 tokio::sync::mpsc channel, Arc<Mutex<Vec>> command queue
 // =============================================================================
 
-// ── imports ───────────────────────────────────────────────────────────────────
-use std::collections::VecDeque;         // lab 1 — data structures
-use std::sync::{Arc, Mutex};            // lab 2 — Arc<Mutex<T>>
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH}; // lab 3
+// ── Standard Library Imports ─────────────────────────────────────────────────
+use std::marker::PhantomData;               // for typestate pattern (Lab 7)
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};               // for shared ownership across tasks (Lab 2)
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use tokio::time::sleep;                  // lab 6 — non-blocking sleep
-use tokio::sync::mpsc;                  // lab 11 — async mpsc channel
-use tokio_util::sync::CancellationToken; // lab 8 — graceful shutdown
+// ── Tokio Async Imports ───────────────────────────────────────────────────────
+use tokio::net::UdpSocket;                  // async UDP socket (Lab 9)
+use tokio::sync::mpsc;                      // async multi-producer single-consumer channel (Lab 11)
+use tokio::time::sleep;                     // async sleep — does NOT block the thread (Lab 6)
+use tokio_util::sync::CancellationToken;    // graceful shutdown token (Lab 8)
 
-use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS}; // lab 9 — MQTT
+// ── External Crate Imports ────────────────────────────────────────────────────
+use rand;                                   // random number generation (Lab 8 fault simulation)
+use serde::{Deserialize, Serialize};        // automatic JSON serialisation/deserialisation
+use serde_json;                             // JSON encode/decode for UDP payloads
 
-use rand; // lab 7 — rand::random_range for fault simulation
 
 // =============================================================================
-//  PART 0 — CONSTANTS   (lab 1 — const)
+//  PART 0 — CONSTANTS   (Lab 1: const keyword)
+//
+//  Constants must have an explicit type, cannot be mutable, and exist
+//  for the entire lifetime of the program.
 // =============================================================================
 
-// GCS-side timing requirements (from assignment)
-const DECODE_DEADLINE_MS:      u64   = 3;      // telemetry must decode within 3ms
-const CMD_SCHEDULE_PERIOD_MS:  u64   = 500;    // uplink supervisor tick
-const HEALTH_PERIOD_MS:        u64   = 200;    // GCS health monitor  RM P1
-const MONITOR_PERIOD_MS:       u64   = 1_000;  // uplink monitor      RM P2
-const ALERT_PERIOD_MS:         u64   = 2_000;  // fault scan          RM P3
+// ── Rate Monotonic Command Periods (milliseconds) ─────────────────────────────
+// Shorter period = higher RM priority (Lab 11 concept)
+const THERMAL_CMD_PERIOD_MS:  u64 = 50;    // RM P1 — fastest, highest priority
+const VELOCITY_CMD_PERIOD_MS: u64 = 120;   // RM P2
+const ATTITUDE_CMD_PERIOD_MS: u64 = 333;   // RM P3 — slowest, lowest priority
 
-// Fault management thresholds
-const GROUND_ALERT_LIMIT_MS:   u64   = 100;    // fault recovery > this → critical alert
-const BACKLOG_WARN_THRESHOLD:  usize = 20;      // unprocessed pkt count → warn
+// ── Timing Deadlines ─────────────────────────────────────────────────────────
+const DECODE_DEADLINE_MS:      u64 = 3;    // soft deadline: parse must complete within 3ms
+const DISPATCH_DEADLINE_MS:    u64 = 2;    // soft deadline: command must be sent within 2ms
+const FAULT_RESPONSE_LIMIT_MS: u64 = 100;  // interlock must engage within 100ms
+const LOC_MISS_THRESHOLD:      u32 = 3;    // loss-of-contact after 3 watchdog misses
+const UPLINK_JITTER_LIMIT_US:  i64 = 2_000;  // warn if uplink jitter > 2ms
+const TELEM_WATCHDOG_MS:       u64 = 800;  // how long without telemetry before incrementing misses
+const REREQUEST_INTERVAL_MS:   u64 = 500;  // how often the LoC monitor checks
 
-// Jitter ceiling for GCS tasks
-const JITTER_LIMIT_US:         i64   = 2_000;  // 2ms
-
-// Simulation
+// ── Simulation Config ─────────────────────────────────────────────────────────
 const SIM_DURATION_S: u64 = 180;
 
-// MQTT — same broker as lab 9, same STUDENT_ID as OCS
-const MQTT_BROKER: &str = "broker.emqx.io";
-const MQTT_PORT:   u16  = 1883;
-const STUDENT_ID:  &str = "tp071542"; // must match OCS STUDENT_ID exactly
+// ── Network Addresses ─────────────────────────────────────────────────────────
+const GCS_TELEM_BIND: &str = "0.0.0.0:9000";
+const OCS_CMD_ADDR:   &str = "127.0.0.1:9001";
+const STUDENT_ID:     &str = "tp071542";
+
 
 // =============================================================================
-//  PART 0 — DATA TYPES   (lab 1 — structs, enums)
+//  SERDE MESSAGE TYPES  (shared wire format with OCS)
+//
+//  OcsMsg mirrors the enum in OCS.rs exactly.
+//  serde_json::from_str::<OcsMsg>(&payload) replaces the old error-prone:
+//    if payload.contains("\"tag\":\"alert\"") { ... }
+//
+//  GcsCmd is serialised with serde_json::to_string(&GcsCmd{...}) and
+//  replaces every manual format!("{{\"tag\":\"cmd\",...}}") string.
 // =============================================================================
 
-// One decoded telemetry packet from OCS
-#[derive(Debug, Clone)]
-struct TelemetryPacket
+// Incoming telemetry messages from the OCS — enum with one variant per message type
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(tag = "tag", rename_all = "snake_case")]
+enum OcsMsg
 {
-    source:       String,  // "thermal" | "accel" | "gyro" | "status" | "downlink"
-    raw_payload:  String,
-    received_ms:  u64,     // UNIX ms of MQTT arrival
-    decoded_ms:   u64,     // UNIX ms after decoding
-    sequence:     u64,
+    Thermal  { student: String, seq: u64, temp: f64,    drift_ms: i64 },
+    Accel    { student: String, seq: u64, mag:  f64                    },
+    Gyro     { student: String, gen: u32, seq:  u64, omega_z:    f64   },
+    Status   { student: String, iter: u64, fill: f64, state: String, drift_ms: i64 },
+    Downlink { student: String, pkt: u64, bytes: usize, q_lat_ms: u64  },
+
+    // Alert uses #[serde(flatten)] so AlertInfo fields merge directly into
+    // the JSON object (same as OCS.rs)
+    Alert    { student: String, event: String, #[serde(flatten)] info: AlertInfo },
 }
 
-// A command queued for uplink to OCS  (lab 1 — struct)
-#[derive(Debug, Clone)]
-struct Command
+// Optional extra fields inside an Alert (same as OCS.rs)
+#[derive(Serialize, Deserialize, Debug, Default)]
+struct AlertInfo
 {
-    id:          u64,
-    command:     String,   // "HEARTBEAT", "ADJUST_ANTENNA", etc.
-    priority:    u8,       // 1 = highest
-    deadline_ms: u64,      // expire time — UNIX ms
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub misses:     Option<u32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count:      Option<u32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fault_type: Option<String>,
 }
 
-// GCS interlock state.  Valid transitions: Clear -> FaultActive -> CriticalAlert
-// (lab 7 typestate concept expressed as a runtime enum because async tasks
-//  cannot own generic PhantomData<S> structs)
-#[derive(Debug, Clone, PartialEq)]
-enum InterlockState
+// Outgoing command sent to OCS over UDP
+// Optional fields are omitted from JSON when None (cleaner wire format)
+#[derive(Serialize, Deserialize, Debug)]
+struct GcsCmd
 {
-    Clear,          // no active fault, commands may uplink
-    FaultActive,    // OCS reported a fault, block commands
-    CriticalAlert,  // recovery exceeded 100ms, hard block
+    pub tag:     String,   // always "cmd"
+    pub student: String,
+    pub cmd:     String,   // e.g. "ThermalCheck", "EmergencyHalt"
+    pub ts:      u64,      // Unix timestamp in ms
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority: Option<u8>,   // RM priority of the issuing task
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iter:     Option<u64>,  // which iteration of the task sent this
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gen:      Option<u32>,  // which generation of the attitude dispatcher
 }
 
-// Fault classification received from OCS via MQTT  (lab 7 — SensorError mirror)
+// Helper: serialise a GcsCmd to a JSON string.
+// Logs on error and returns "" so the caller can safely send an empty string.
+fn encode_cmd(cmd: &GcsCmd) -> String
+{
+    serde_json::to_string(cmd)
+        .unwrap_or_else(|e|
+        {
+            println!("[ENCODE] {e}");
+            String::new()
+        })
+}
+
+
+// =============================================================================
+//  LAB 7 — GCS MODE TYPESTATE  (PhantomData<S>)
+//
+//  This is the same pattern as the Door typestate in Lab 7.
+//
+//  Door analogy → GcsMode analogy:
+//    Door<Locked>       →  GcsMode<Normal>       (commands allowed)
+//    Door<Unlocked>     →  GcsMode<FaultLocked>  (commands BLOCKED)
+//    door.unlock()      →  mode.lock_for_fault()
+//    door.lock()        →  mode.clear_fault()
+//
+//  The key safety property: dispatch_command() takes &GcsMode<Normal>.
+//  Passing a GcsMode<FaultLocked> is a COMPILE ERROR.
+//  The compiler literally prevents sending commands during a fault condition.
+//
+//  Each command task:
+//    1. Checks the runtime fault_active flag.
+//    2. If clear → constructs GcsMode::<Normal>::new().
+//    3. Passes it to dispatch_command() — compile-time proof it's Normal.
+// =============================================================================
+
+// The two possible GCS operating modes
+struct Normal;
+struct FaultLocked;
+
+// Generic GCS mode struct — S is the current mode
+struct GcsMode<S>
+{
+    _state: PhantomData<S>  // zero-size marker; no runtime cost
+}
+
+// Methods available ONLY in Normal mode (Lab 7: impl Door<Locked>)
+impl GcsMode<Normal>
+{
+    fn new() -> Self
+    {
+        GcsMode { _state: PhantomData }
+    }
+
+    // Normal → FaultLocked (Lab 7: door.unlock() → Door<Unlocked>)
+    fn lock_for_fault(self) -> GcsMode<FaultLocked>
+    {
+        println!("[GcsMode]  Normal → FaultLocked — commands BLOCKED");
+        GcsMode { _state: PhantomData }
+    }
+}
+
+// Methods available ONLY in FaultLocked mode (Lab 7: impl Door<Unlocked>)
+impl GcsMode<FaultLocked>
+{
+    // FaultLocked → Normal (Lab 7: door.lock() → Door<Locked>)
+    fn clear_fault(self) -> GcsMode<Normal>
+    {
+        println!("[GcsMode]  FaultLocked → Normal — commands RESTORED");
+        GcsMode { _state: PhantomData }
+    }
+    // NOTE: No dispatch_command() here — you CANNOT dispatch during fault.
+    // NOTE: No lock_for_fault() here — you cannot double-lock.
+}
+
+// This function ONLY accepts GcsMode<Normal>.
+// If you try to call it with GcsMode<FaultLocked>, the compiler rejects it.
+// This is the same idea as Door<Open> having no .lock() method in Lab 7.
+fn dispatch_command(
+    _mode:    &GcsMode<Normal>,         // compile-time proof: we are in Normal mode
+    cmd_tx:   &mpsc::Sender<UplinkCmd>,
+    payload:  String,
+    priority: u8,
+)
+{
+    // try_send is non-blocking — if the channel is full, we silently drop
+    let _ = cmd_tx.try_send(UplinkCmd
+    {
+        payload,
+        priority,
+        created_at: Instant::now(),
+    });
+}
+
+
+// =============================================================================
+//  DATA TYPES   (Lab 1: structs, enums)
+// =============================================================================
+
+// A raw incoming UDP packet, timestamped at arrival before any processing
+// Lab 3: we stamp received_at before any processing to measure decode latency
 #[derive(Debug)]
-enum FaultAlert
+struct IncomingPacket
 {
-    ThermalAlert  { misses: u32 },
-    GyroRestart   { generation: u32 },
-    FaultInjected { type_str: String },
+    payload:     String,
+    received_at: Instant,  // stamped BEFORE processing (Lab 3: latency measurement)
+    from:        SocketAddr,
 }
 
-// Result of an uplink attempt  (lab 7 — Result / enum pattern)
-#[derive(Debug)]
-enum UplinkResult
+// An outgoing command waiting to be sent to OCS
+#[derive(Debug, Clone)]
+struct UplinkCmd
 {
-    Sent,
-    Blocked(String),   // reason string
-    DeadlineMissed,
-}
-
-// Internal MQTT-to-decoder message  (lab 11 — Job struct equivalent)
-struct RawMqttMsg
-{
-    topic:      String,
     payload:    String,
-    arrival_ms: u64,
+    priority:   u8,
+    created_at: Instant,  // Lab 3: dispatch latency measured from this
 }
 
-// Shared GCS metrics  (lab 2 — Arc<Mutex<T>>)
+// Lab 7: fault classification enum — mirrors SensorError from Lab 7
+// classify_event() converts the OCS alert's event string into this typed enum
+#[derive(Debug)]
+enum OcsFaultKind
+{
+    ThermalAlert,
+    FaultInjected,
+    GyroRestart,
+    MissionAbort,
+    Unknown,
+}
+
+// All GCS performance metrics (collected across all tasks)
 #[derive(Default)]
 struct GcsMetrics
 {
-    // Telemetry pipeline
-    pkts_received:        u64,
-    pkts_decoded:         u64,
+    // Telemetry reception
+    telemetry_received:   u64,
+    missed_packets:       u64,
+
+    // Lab 3: decode and dispatch latency measurement
     decode_latency_us:    Vec<u64>,
-    reception_drift_ms:   Vec<i64>,  // actual interval − expected
-
-    // Backlog depth snapshots (lab 11 — queue utilisation)
-    backlog_samples: Vec<usize>,
-
-    // Link jitter  (inter-packet arrival variance)
-    link_jitter_us:       Vec<i64>,
-    last_pkt_arrival_ms:  u64,
+    reception_drift_ms:   Vec<i64>,
 
     // Command uplink
-    cmds_sent:            u64,
-    cmds_blocked:         u64,
-    cmds_deadline_miss:   u64,
-    cmd_log:              Vec<String>,
+    commands_sent:        u64,
+    commands_rejected:    u64,
+    dispatch_latency_us:  Vec<u64>,
+    rejection_log:        Vec<String>,
 
-    // Fault management
+    // Timing violations
+    deadline_violations:  Vec<String>,
+
+    // Lab 2 / Lab 11: jitter per RM task
+    thermal_jitter_us:    Vec<i64>,
+    velocity_jitter_us:   Vec<i64>,
+    attitude_jitter_us:   Vec<i64>,
+
+    // Fault handling
     faults_received:      u64,
-    fault_recovery_ms:    Vec<u64>,
     interlock_latency_ms: Vec<u64>,
-    ground_alerts:        Vec<String>,
+    critical_alerts:      Vec<String>,
 
-    // Task jitter / drift for GCS RM tasks
-    task_jitter_us: Vec<i64>,
-    task_drift_ms:  Vec<i64>,
+    // CPU estimate
+    drift_ms:    Vec<i64>,
+    active_ms:   u64,
+    elapsed_ms:  u64,
 
-    // Lab 8 supervisor count
-    uplink_restarts: u32,
+    // Lab 8: how many times attitude supervisor restarted
+    attitude_restarts: u32,
 }
 
+// Runtime GCS state shared across tasks
+struct GcsState
+{
+    fault_active:       bool,
+    fault_detected_at:  Option<Instant>,
+    fault_log:          Vec<String>,
+
+    // Lab 7: consecutive miss counters (same pattern as Lab 7's glitch_count)
+    thermal_misses:     u32,
+    velocity_misses:    u32,
+    attitude_misses:    u32,
+
+    // Watchdog timestamps — updated on each successful telemetry receipt
+    last_thermal_ms:    u64,
+    last_velocity_ms:   u64,
+    last_attitude_ms:   u64,
+
+    loss_of_contact:    bool,
+}
+
+// impl Default so we can write GcsState::default() in main
+impl Default for GcsState
+{
+    fn default() -> Self
+    {
+        let t = now_ms();
+        GcsState
+        {
+            fault_active:      false,
+            fault_detected_at: None,
+            fault_log:         Vec::new(),
+            thermal_misses:    0,
+            velocity_misses:   0,
+            attitude_misses:   0,
+            last_thermal_ms:   t,
+            last_velocity_ms:  t,
+            last_attitude_ms:  t,
+            loss_of_contact:   false,
+        }
+    }
+}
+
+
 // =============================================================================
-//  HELPERS
+//  HELPER FUNCTIONS
 // =============================================================================
 
+// Returns current Unix time in milliseconds
 fn now_ms() -> u64
 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
 }
 
-// min/max/avg row — mirrors lab 3's print_stats helper
+// Pretty-print one row of the metrics table (Lab 3: min/max/avg statistics)
 fn print_stat_row(label: &str, samples: &[i64])
 {
     if samples.is_empty()
     {
-        println!("    {:<38} — no data", label);
+        println!("    {:<36} — no data", label);
         return;
     }
+
     let min = samples.iter().min().unwrap();
     let max = samples.iter().max().unwrap();
     let avg = samples.iter().sum::<i64>() as f64 / samples.len() as f64;
+
     println!(
-        "    {:<38} n={:>5}  min={:>7}  max={:>7}  avg={:>9.1}",
+        "    {:<36} n={:>5}  min={:>7}  max={:>7}  avg={:>9.1}",
         label, samples.len(), min, max, avg
     );
 }
 
-// =============================================================================
-//  MQTT SETUP   (lab 9)
-//
-//  GCS is the subscriber side.  Subscribes to all OCS publish topics.
-//  Returns the client handle so tasks can also publish uplink commands.
-// =============================================================================
-
-async fn setup_mqtt(shutdown: CancellationToken) -> AsyncClient
+// Lab 7: convert the OCS alert's event string into a typed OcsFaultKind enum.
+// This is called AFTER serde has already validated the outer message structure,
+// so we only need to match on the inner event string.
+fn classify_event(event: &str) -> OcsFaultKind
 {
-    // Unique client ID — same rule as lab 9
-    let client_id = format!("gcs_{}_{}", STUDENT_ID, now_ms() % 100_000);
-
-    // Steps 1 & 2  (lab 9)
-    let mut mqttoptions = MqttOptions::new(client_id, MQTT_BROKER, MQTT_PORT);
-    mqttoptions.set_keep_alive(Duration::from_secs(5));
-
-    // Step 3  (lab 9)
-    let (client, mut eventloop) = AsyncClient::new(mqttoptions, 50);
-
-    // Subscribe to every OCS publish topic  (lab9_server.rs subscribe pattern)
-    for suffix in ["telemetry/thermal", "telemetry/accel", "telemetry/gyro",
-                   "status", "downlink", "alerts"]
+    match event
     {
-        let topic = format!("ocs/{}/{}", STUDENT_ID, suffix);
-        client.subscribe(&topic, QoS::AtMostOnce).await
-              .unwrap_or_else(|e| println!("[MQTT] Subscribe error '{}': {e}", topic));
-        println!("[MQTT] Subscribed → '{topic}'");
+        "mission_abort" => OcsFaultKind::MissionAbort,
+        "thermal_alert" => OcsFaultKind::ThermalAlert,
+        "gyro_restart"  => OcsFaultKind::GyroRestart,
+        "fault"         => OcsFaultKind::FaultInjected,
+        _               => OcsFaultKind::Unknown,
     }
+}
 
-    println!("[MQTT] Uplink commands → gcs/{STUDENT_ID}/commands");
 
-    // Step 4  (lab 9) — event loop must stay alive; add lab 8 shutdown arm
-    tokio::spawn(async move
+// =============================================================================
+//  UDP RECEIVER LOOP   (Lab 9: tokio::net::UdpSocket async recv_from)
+//
+//  Continuously receives UDP packets from the OCS and forwards them
+//  to the telemetry processor via an mpsc channel (Lab 11).
+//
+//  Lab 6: tokio::select! allows waiting on EITHER the shutdown signal
+//  OR a new packet arriving — whichever happens first.
+//  This is the non-blocking version of the Lab 9 blocking recv_from().
+// =============================================================================
+
+async fn udp_receiver_loop(
+    sock:        Arc<UdpSocket>,
+    incoming_tx: mpsc::Sender<IncomingPacket>,  // Lab 11: producer side of channel
+    shutdown:    CancellationToken,              // Lab 8: cancellation signal
+)
+{
+    println!("[UDP-RX]   Listening for OCS telemetry on {GCS_TELEM_BIND}");
+
+    let mut buf = vec![0u8; 65535];
+
+    loop
     {
-        loop
+        // Lab 8: tokio::select! waits for the FIRST of these two futures to complete
+        tokio::select!
         {
-            tokio::select!
+            // Branch 1: shutdown was requested
+            _ = shutdown.cancelled() =>
             {
-                _ = shutdown.cancelled() => { println!("[MQTT] Event loop exit."); return; }
-                result = eventloop.poll() =>
+                println!("[UDP-RX]   Exit.");
+                return;
+            }
+
+            // Branch 2: a UDP packet arrived
+            result = sock.recv_from(&mut buf) =>
+            {
+                match result
                 {
-                    match result
+                    Ok((len, from)) =>
                     {
-                        Ok(_)  => {}
-                        Err(e) =>
+                        // Lab 3: stamp the arrival time BEFORE any processing
+                        let received_at = Instant::now();
+                        let payload = String::from_utf8_lossy(&buf[..len]).to_string();
+
+                        // Lab 11: send to telemetry processor via channel
+                        if incoming_tx.try_send(IncomingPacket { payload, received_at, from }).is_err()
                         {
-                            println!("[MQTT] Connection error: {e}. Retrying in 2s...");
-                            sleep(Duration::from_secs(2)).await;
+                            println!("[UDP-RX]   Channel full — packet dropped");
                         }
                     }
+                    Err(e) => println!("[UDP-RX]   recv_from: {e}"),
                 }
             }
         }
-    });
-
-    client
+    }
 }
 
+
 // =============================================================================
-//  MQTT RECEIVER TASK   (lab 9 subscriber + lab 11 mpsc producer)
+//  UDP SENDER TASK   (Lab 9: send_to + Lab 11: mpsc consumer)
 //
-//  Opens a second MQTT connection dedicated to receiving OCS publishes.
-//  Forwards each raw message to the telemetry decoder task via mpsc.
-//  This is the "producer" half of the lab 11 channel pattern.
+//  Consumes UplinkCmd messages from an mpsc channel and sends them
+//  to the OCS over UDP. Also measures dispatch latency (Lab 3).
+//
+//  Lab 6: tokio::select! between shutdown and next command in channel.
 // =============================================================================
 
-async fn mqtt_receiver_task(
-    mqtt_tx:  mpsc::Sender<RawMqttMsg>, // lab 11 — producer sends to decoder
+async fn udp_sender_task(
+    mut rx:   mpsc::Receiver<UplinkCmd>,
+    sock:     Arc<UdpSocket>,
     metrics:  Arc<Mutex<GcsMetrics>>,
     shutdown: CancellationToken,
 )
 {
-    println!("[MQTT-RX]  Receiver online.");
-
-    // Second connection for incoming data
-    let rx_id = format!("gcs_rx_{}_{}", STUDENT_ID, now_ms() % 100_000);
-    let mut opts = MqttOptions::new(rx_id, MQTT_BROKER, MQTT_PORT);
-    opts.set_keep_alive(Duration::from_secs(5));
-    let (rx_client, mut eventloop) = AsyncClient::new(opts, 50);
-
-    for suffix in ["telemetry/thermal", "telemetry/accel", "telemetry/gyro",
-                   "status", "downlink", "alerts"]
-    {
-        rx_client.subscribe(
-            &format!("ocs/{}/{}", STUDENT_ID, suffix),
-            QoS::AtMostOnce
-        ).await.ok();
-    }
+    println!("[UDP-TX]   Command sender → {OCS_CMD_ADDR}");
 
     loop
     {
-        // lab 8 — select! races shutdown vs network event
+        // Lab 8: select on either shutdown or next command
         tokio::select!
         {
-            _ = shutdown.cancelled() => { println!("[MQTT-RX]  Exit."); return; }
-            result = eventloop.poll() =>
+            _ = shutdown.cancelled() =>
             {
-                match result
+                println!("[UDP-TX]   Exit.");
+                return;
+            }
+
+            cmd = rx.recv() =>
+            {
+                match cmd
                 {
-                    Ok(Event::Incoming(Packet::Publish(p))) =>
+                    Some(c) =>
                     {
-                        let arrival_ms = now_ms();
-                        let payload    = String::from_utf8_lossy(&p.payload).to_string();
+                        // Lab 3: measure how long the command sat in the queue
+                        let dispatch_us = c.created_at.elapsed().as_micros() as u64;
 
-                        // Link jitter — time since last packet  (lab 2 jitter formula)
+                        match sock.send_to(c.payload.as_bytes(), OCS_CMD_ADDR).await
                         {
-                            let mut m = metrics.lock().unwrap();
-                            if m.last_pkt_arrival_ms > 0
+                            Ok(_) =>
                             {
-                                let gap_ms   = arrival_ms as i64 - m.last_pkt_arrival_ms as i64;
-                                let jit_us   = (gap_ms * 1_000).unsigned_abs() as i64;
-                                m.link_jitter_us.push(jit_us);
-                            }
-                            m.last_pkt_arrival_ms = arrival_ms;
-                            m.pkts_received      += 1;
-                        }
+                                // Check dispatch deadline
+                                if dispatch_us / 1_000 > DISPATCH_DEADLINE_MS
+                                {
+                                    let v = format!(
+                                        "[{}ms] [DEADLINE] Dispatch {}µs > {}ms",
+                                        now_ms(), dispatch_us, DISPATCH_DEADLINE_MS
+                                    );
+                                    println!("{v}");
+                                    metrics.lock().unwrap().deadline_violations.push(v);
+                                }
 
-                        // lab 11 — send to consumer (telemetry_decoder_task)
-                        let _ = mqtt_tx.try_send(RawMqttMsg
-                        {
-                            topic:      p.topic.clone(),
-                            payload,
-                            arrival_ms,
-                        });
+                                let mut m = metrics.lock().unwrap();
+                                m.commands_sent += 1;
+                                m.dispatch_latency_us.push(dispatch_us);
+                            }
+                            Err(e) => println!("[UDP-TX]   send_to: {e}"),
+                        }
                     }
-                    Ok(_)  => {}
-                    Err(e) =>
-                    {
-                        println!("[MQTT-RX]  Error: {e}. Retrying...");
-                        sleep(Duration::from_millis(500)).await;
-                    }
+                    None => return,  // channel closed — all senders dropped
                 }
             }
         }
     }
 }
 
+
 // =============================================================================
-//  PART 1 — TELEMETRY RECEPTION AND DECODING
+//  PART 1 — TELEMETRY PROCESSOR  (Lab 6: spawn_blocking + serde deserialise)
 //
-//  Drains the mpsc channel (lab 11 consumer), decodes each packet within
-//  the 3ms assignment deadline (lab 3 timing), measures reception drift
-//  (lab 2 formula), and logs any deadline misses.
+//  Receives raw UDP packets from the udp_receiver_loop via mpsc channel
+//  and decodes them into typed OcsMsg values using serde_json.
+//
+//  KEY LESSON from Lab 6:
+//  JSON parsing is CPU-bound synchronous work. Running it inline would
+//  block the Tokio worker thread (same problem as heavy_work() in Lab 6).
+//  Solution: offload it with spawn_blocking() to a dedicated OS thread,
+//  keeping the async runtime free for other tasks.
+//
+//  After decoding, each variant is handled by a match arm — no more
+//  fragile payload.contains("\"tag\":\"alert\"") string checks.
 // =============================================================================
 
-// Parse fault alerts and update interlock state  (lab 7 — match on enum)
-fn handle_alert_payload(
-    payload:   &str,
-    interlock: &Arc<Mutex<InterlockState>>,
-    metrics:   &Arc<Mutex<GcsMetrics>>,
-)
+// Synchronous decode function — runs inside spawn_blocking (Lab 6).
+// serde_json::from_str parses the raw bytes into a typed OcsMsg.
+fn decode_packet_sync(payload: String) -> Result<OcsMsg, String>
 {
-    // Manual JSON parse — no serde (tutorial-aligned, same style as lab9 payloads)
-    // lab 7 — match on FaultAlert variants, mirrors match on SensorError
-    let alert: Option<FaultAlert> =
-        if payload.contains("thermal_alert")
-        {
-            let misses = payload.split("misses\":").nth(1)
-                .and_then(|s| s.split('}').next())
-                .and_then(|s| s.trim().parse::<u32>().ok())
-                .unwrap_or(0);
-            Some(FaultAlert::ThermalAlert { misses })
-        }
-        else if payload.contains("gyro_restart")
-        {
-            let generation = payload.split("generation\":").nth(1)
-                .and_then(|s| s.split('}').next())
-                .and_then(|s| s.trim().parse::<u32>().ok())
-                .unwrap_or(0);
-            Some(FaultAlert::GyroRestart { generation: generation })
-        }
-        else if payload.contains("\"event\":\"fault\"")
-        {
-            let type_str = payload.split("\"type\":\"").nth(1)
-                .and_then(|s| s.split('"').next())
-                .unwrap_or("Unknown")
-                .to_string();
-            Some(FaultAlert::FaultInjected { type_str })
-        }
-        else { None };
-
-    if let Some(a) = alert
-    {
-        let msg = format!("[{}ms] [ALERT] Received from OCS: {:?}", now_ms(), a);
-        println!("{msg}");
-        let mut m = metrics.lock().unwrap();
-        m.faults_received += 1;
-        m.cmd_log.push(msg);
-
-        // Engage interlock — block commands until resolved
-        let mut il = interlock.lock().unwrap();
-        if *il == InterlockState::Clear { *il = InterlockState::FaultActive; }
-    }
+    serde_json::from_str::<OcsMsg>(&payload)
+        .map_err(|e| format!("serde parse error: {e}  payload={payload}"))
 }
 
-async fn telemetry_decoder_task(
-    mut rx:    mpsc::Receiver<RawMqttMsg>, // lab 11 — mpsc consumer
-    backlog:   Arc<Mutex<VecDeque<TelemetryPacket>>>,
-    metrics:   Arc<Mutex<GcsMetrics>>,
-    interlock: Arc<Mutex<InterlockState>>,
-    shutdown:  CancellationToken,
+async fn telemetry_processor_task(
+    mut rx:   mpsc::Receiver<IncomingPacket>,   // Lab 11: consumer
+    state:    Arc<Mutex<GcsState>>,
+    metrics:  Arc<Mutex<GcsMetrics>>,
+    cmd_tx:   mpsc::Sender<UplinkCmd>,
+    shutdown: CancellationToken,
 )
 {
-    println!("[Decoder]  Telemetry decoder  decode_limit={}ms", DECODE_DEADLINE_MS);
-    let mut seq:            u64 = 0;
-    let mut last_arrival:   u64 = 0;
+    println!(
+        "[TelRx]    Processor ready.  decode_deadline={}ms  (spawn_blocking + serde)",
+        DECODE_DEADLINE_MS
+    );
+
+    let mut last_any_rx: Option<Instant> = None;
 
     loop
     {
-        // lab 8 — select! races shutdown vs incoming message
+        // Lab 8: select on either shutdown or next incoming packet
         tokio::select!
         {
-            _ = shutdown.cancelled() => { println!("[Decoder]  Exit."); return; }
-            msg = rx.recv() =>
+            _ = shutdown.cancelled() =>
             {
-                match msg
+                println!("[TelRx]    Exit.");
+                return;
+            }
+
+            pkt = rx.recv() =>
+            {
+                match pkt
                 {
-                    None => return, // channel closed
-                    Some(raw) =>
+                    None => return,  // channel closed
+                    Some(p) =>
                     {
-                        // lab 3 — time the decode with Instant::now()
-                        let decode_t0 = Instant::now();
+                        let arrival  = p.received_at;
+                        let from     = p.from;
+                        let payload  = p.payload.clone();
 
-                        // Reception drift  (lab 2 — expected vs actual interval)
-                        let drift_ms = if last_arrival > 0
-                            { raw.arrival_ms as i64 - last_arrival as i64 }
-                            else { 0 };
-                        last_arrival = raw.arrival_ms;
+                        // ── Lab 6: spawn_blocking for CPU-bound JSON parsing ───────────────
+                        // decode_packet_sync is a blocking/synchronous function.
+                        // Calling it directly inside async would block the Tokio thread.
+                        // spawn_blocking moves it to a separate OS thread pool — same
+                        // lesson as heavy_work() using spawn_blocking in Lab 6.
+                        let decode_result = tokio::task::spawn_blocking(
+                            move || decode_packet_sync(payload)
+                        ).await;
 
-                        // Check for alerts first — fastest path to interlock
-                        if raw.topic.ends_with("/alerts")
+                        // Lab 3: measure decode latency from the moment the packet arrived
+                        let decode_us = arrival.elapsed().as_micros() as u64;
+                        let decode_ms = decode_us / 1_000;
+
+                        if decode_ms > DECODE_DEADLINE_MS
                         {
-                            handle_alert_payload(&raw.payload, &interlock, &metrics);
+                            let v = format!(
+                                "[{}ms] [DEADLINE] Decode {}ms > {}ms  from={from}",
+                                now_ms(), decode_ms, DECODE_DEADLINE_MS
+                            );
+                            println!("{v}");
+                            metrics.lock().unwrap().deadline_violations.push(v);
                         }
 
-                        let source = raw.topic
-                            .rsplit('/')
-                            .next()
-                            .unwrap_or("unknown")
-                            .to_string();
-
-                        seq += 1;
-                        let pkt = TelemetryPacket
+                        // Unwrap the JoinHandle result first, then the parse result
+                        let msg = match decode_result
                         {
-                            source:      source.clone(),
-                            raw_payload: raw.payload.clone(),
-                            received_ms: raw.arrival_ms,
-                            decoded_ms:  now_ms(),
-                            sequence:    seq,
+                            Err(_)       =>
+                            {
+                                println!("[TelRx]    spawn_blocking panic");
+                                continue;
+                            }
+                            Ok(Err(why)) =>
+                            {
+                                println!("[TelRx]    Parse fail: {why}");
+                                continue;
+                            }
+                            Ok(Ok(m))    => m,
                         };
 
-                        let decode_us  = decode_t0.elapsed().as_micros() as u64;
-                        let decode_ms  = decode_t0.elapsed().as_millis() as u64;
-
-                        println!(
-                            "[Decoder]  seq={seq:>5}  src={source:<12}  \
-                             decode={}µs  drift={drift_ms:+}ms",
-                            decode_us
-                        );
-
-                        // Log deadline miss if decode took > 3ms
+                        // Reception drift (Lab 2: jitter formula)
+                        let drift_ms: i64 = if let Some(prev) = last_any_rx
                         {
-                            let mut m = metrics.lock().unwrap();
-                            m.pkts_decoded       += 1;
-                            m.decode_latency_us.push(decode_us);
-                            m.reception_drift_ms.push(drift_ms);
+                            prev.elapsed().as_millis() as i64
+                                - THERMAL_CMD_PERIOD_MS as i64 * 10
+                        }
+                        else
+                        {
+                            0
+                        };
+                        last_any_rx = Some(Instant::now());
 
-                            if decode_ms > DECODE_DEADLINE_MS
+                        // ── serde: match on typed OcsMsg variants ────────────────────────
+                        // Before serde, this was: if payload.contains("\"tag\":\"alert\"") { ... }
+                        // Now the compiler verifies every field exists and has the right type.
+                        match &msg
+                        {
+                            OcsMsg::Alert { event, .. } =>
                             {
-                                let v = format!(
-                                    "[{}ms] [DEADLINE] Decode {}ms > limit {}ms  seq={seq}",
-                                    now_ms(), decode_ms, DECODE_DEADLINE_MS
+                                // Delegate to the fault handler
+                                handle_ocs_alert(&msg, &state, &metrics, &cmd_tx);
+                                continue;
+                            }
+
+                            OcsMsg::Thermal { seq, temp, drift_ms: sensor_drift, .. } =>
+                            {
+                                println!(
+                                    "[TelRx]    thermal  seq={seq}  temp={temp:.2}°C  \
+                                     sensor_drift={sensor_drift:+}ms  decode={decode_us}µs"
                                 );
-                                println!("{v}");
-                                m.cmd_log.push(v);
+
+                                // Lab 7: reset consecutive miss counter on success
+                                let mut s = state.lock().unwrap();
+                                s.thermal_misses  = 0;
+                                s.last_thermal_ms = now_ms();
+
+                                if s.loss_of_contact
+                                {
+                                    s.loss_of_contact = false;
+                                    println!("[TelRx] Contact restored.");
+                                }
+                            }
+
+                            OcsMsg::Status { iter, fill, state: sys_state, .. } =>
+                            {
+                                println!(
+                                    "[TelRx]    status   iter={iter}  fill={fill:.1}%  \
+                                     state={sys_state}  decode={decode_us}µs"
+                                );
+                                let mut s = state.lock().unwrap();
+                                s.thermal_misses  = 0;
+                                s.last_thermal_ms = now_ms();
+                                if s.loss_of_contact { s.loss_of_contact = false; }
+                            }
+
+                            OcsMsg::Accel { seq, mag, .. } =>
+                            {
+                                println!(
+                                    "[TelRx]    accel    seq={seq}  mag={mag:.4}  \
+                                     decode={decode_us}µs"
+                                );
+                                let mut s = state.lock().unwrap();
+                                s.velocity_misses  = 0;
+                                s.last_velocity_ms = now_ms();
+                                if s.loss_of_contact { s.loss_of_contact = false; }
+                            }
+
+                            OcsMsg::Gyro { gen, seq, omega_z, .. } =>
+                            {
+                                println!(
+                                    "[TelRx]    gyro     gen={gen}  seq={seq}  \
+                                     ω_z={omega_z:.4}  decode={decode_us}µs"
+                                );
+                                let mut s = state.lock().unwrap();
+                                s.attitude_misses  = 0;
+                                s.last_attitude_ms = now_ms();
+                                if s.loss_of_contact { s.loss_of_contact = false; }
+                            }
+
+                            OcsMsg::Downlink { pkt, bytes, q_lat_ms, .. } =>
+                            {
+                                println!(
+                                    "[TelRx]    downlink pkt={pkt}  {bytes}B  \
+                                     q_lat={q_lat_ms}ms  decode={decode_us}µs"
+                                );
+                                let mut s = state.lock().unwrap();
+                                s.velocity_misses  = 0;
+                                s.last_velocity_ms = now_ms();
+                                if s.loss_of_contact { s.loss_of_contact = false; }
                             }
                         }
 
-                        // Push to backlog  (lab 11 — shared Arc<Mutex<Vec>> job queue)
-                        backlog.lock().unwrap().push_back(pkt);
+                        let mut m = metrics.lock().unwrap();
+                        m.telemetry_received += 1;
+                        m.decode_latency_us.push(decode_us);
+                        m.reception_drift_ms.push(drift_ms);
                     }
                 }
             }
@@ -477,477 +737,615 @@ async fn telemetry_decoder_task(
     }
 }
 
-// =============================================================================
-//  PART 2 — COMMAND UPLINK SCHEDULE
-//
-//  RM priority for GCS background tasks:
-//    gcs_health_monitor  200ms  RM P1
-//    uplink_monitor      1000ms RM P2
-//    fault_manager       2000ms RM P3  (preemptible via select!)
-//
-//  Every command is validated against InterlockState before uplink —
-//  the lab 7 "only valid transitions are permitted" principle expressed
-//  as a runtime match rather than compile-time PhantomData typestates.
-// =============================================================================
-
-// ── Lab 8 Part 1 — fragile uplink task ────────────────────────────────────────
-// Direct equivalent of fragile_worker() in lab 8.
-// Does real uplink work but has a small random chance to panic,
-// simulating a radio hardware fault or driver crash.
-async fn fragile_uplink(
-    generation:  u32,
-    cmd_queue:   Arc<Mutex<Vec<Command>>>,
-    metrics:     Arc<Mutex<GcsMetrics>>,
-    interlock:   Arc<Mutex<InterlockState>>,
-    mqtt_client: AsyncClient,
+// Handle an incoming OCS Alert message.
+// Takes the typed OcsMsg (already validated by serde) instead of a raw &str.
+// Lab 7: classify the event string, then match on the typed enum variant.
+fn handle_ocs_alert(
+    msg:     &OcsMsg,
+    state:   &Arc<Mutex<GcsState>>,
+    metrics: &Arc<Mutex<GcsMetrics>>,
+    cmd_tx:  &mpsc::Sender<UplinkCmd>,
 )
 {
-    println!("[Uplink-{generation}]  Started  period={}ms", CMD_SCHEDULE_PERIOD_MS);
+    // Extract the event string from the Alert variant
+    let event = match msg
+    {
+        OcsMsg::Alert { event, .. } => event.as_str(),
+        _                           => return,  // not an alert — ignore
+    };
+
+    // Lab 7: convert event string → typed OcsFaultKind enum
+    let kind = classify_event(event);
+    println!("[FaultMgr] OCS alert: {kind:?}  event=\"{event}\"");
+
+    let fault_msg = format!("[{}ms] [OCS-ALERT] {kind:?}", now_ms());
+
+    let mut s = state.lock().unwrap();
+    let mut m = metrics.lock().unwrap();
+
+    m.faults_received += 1;
+    s.fault_log.push(fault_msg);
+
+    // Lab 7: match on enum variant (mirrors the fault_injector match in OCS)
+    match kind
+    {
+        OcsFaultKind::MissionAbort =>
+        {
+            let alert = format!(
+                "[{}ms] !!! CRITICAL GROUND ALERT !!! Mission Abort",
+                now_ms()
+            );
+            println!("{alert}");
+            m.critical_alerts.push(alert);
+
+            if !s.fault_active
+            {
+                s.fault_active      = true;
+                s.fault_detected_at = Some(Instant::now());
+            }
+
+            // Emergency halt bypasses typestate — this IS the fault-setter path
+            let payload = encode_cmd(&GcsCmd
+            {
+                tag:      "cmd".into(),
+                student:  STUDENT_ID.into(),
+                cmd:      "EmergencyHalt".into(),
+                ts:       now_ms(),
+                priority: Some(1),
+                iter:     None,
+                gen:      None,
+            });
+            let _ = cmd_tx.try_send(UplinkCmd
+            {
+                payload,
+                priority:   1,
+                created_at: Instant::now(),
+            });
+        }
+
+        OcsFaultKind::ThermalAlert | OcsFaultKind::FaultInjected | OcsFaultKind::GyroRestart =>
+        {
+            if !s.fault_active
+            {
+                s.fault_active      = true;
+                s.fault_detected_at = Some(Instant::now());
+                println!("[FaultMgr] Safety interlock ENGAGED — commands blocked");
+            }
+        }
+
+        OcsFaultKind::Unknown =>
+        {
+            println!("[FaultMgr] Unknown alert \"{event}\" — logged, interlock not engaged");
+        }
+    }
+}
+
+
+// =============================================================================
+//  LOSS-OF-CONTACT MONITOR  (Lab 7 consecutive-miss + Lab 6 heartbeat)
+//
+//  This task runs like the heartbeat() from Lab 6 — it fires periodically
+//  and checks whether telemetry has been received recently.
+//
+//  Lab 7: consecutive miss counters are reset on every received telemetry
+//  message (same pattern as glitch_count reset in Lab 7's run_sensor_loop).
+//  When misses exceed LOC_MISS_THRESHOLD → Loss of Contact.
+// =============================================================================
+
+async fn loss_of_contact_monitor_task(
+    state:    Arc<Mutex<GcsState>>,
+    metrics:  Arc<Mutex<GcsMetrics>>,
+    cmd_tx:   mpsc::Sender<UplinkCmd>,
+    shutdown: CancellationToken,
+)
+{
+    println!("[LoC]      Monitor  threshold={LOC_MISS_THRESHOLD}");
+
+    loop
+    {
+        // Lab 8: select between shutdown and the next check interval
+        tokio::select!
+        {
+            _ = shutdown.cancelled() =>
+            {
+                println!("[LoC]      Exit.");
+                return;
+            }
+            _ = sleep(Duration::from_millis(REREQUEST_INTERVAL_MS)) => {}
+        }
+
+        let ts = now_ms();
+
+        // Read current miss counts and timestamps
+        let (th, vel, att, last_th, last_vel, last_att, loc);
+        {
+            let s   = state.lock().unwrap();
+            th      = s.thermal_misses;
+            vel     = s.velocity_misses;
+            att     = s.attitude_misses;
+            last_th = s.last_thermal_ms;
+            last_vel= s.last_velocity_ms;
+            last_att= s.last_attitude_ms;
+            loc     = s.loss_of_contact;
+        }
+
+        // Increment miss counters for any silent telemetry channel
+        {
+            let mut s = state.lock().unwrap();
+            if ts.saturating_sub(last_th)  > TELEM_WATCHDOG_MS { s.thermal_misses  += 1; }
+            if ts.saturating_sub(last_vel) > TELEM_WATCHDOG_MS { s.velocity_misses += 1; }
+            if ts.saturating_sub(last_att) > TELEM_WATCHDOG_MS { s.attitude_misses += 1; }
+        }
+
+        let max_m = th.max(vel).max(att);
+
+        if max_m >= LOC_MISS_THRESHOLD && !loc
+        {
+            let alert = format!(
+                "[{ts}ms] !!! LOSS OF CONTACT !!!  th={th} vel={vel} att={att}"
+            );
+            println!("{alert}");
+            metrics.lock().unwrap().critical_alerts.push(alert);
+            state.lock().unwrap().loss_of_contact = true;
+            metrics.lock().unwrap().missed_packets += max_m as u64;
+
+            // serde: encode a re-request command and send to OCS
+            let payload = encode_cmd(&GcsCmd
+            {
+                tag:      "cmd".into(),
+                student:  STUDENT_ID.into(),
+                cmd:      "RetransmitRequest".into(),
+                ts,
+                priority: Some(1),
+                iter:     None,
+                gen:      None,
+            });
+            let _ = cmd_tx.try_send(UplinkCmd
+            {
+                payload,
+                priority:   1,
+                created_at: Instant::now(),
+            });
+
+            println!("[LoC]      Re-request sent.");
+        }
+        else if loc && max_m < LOC_MISS_THRESHOLD
+        {
+            state.lock().unwrap().loss_of_contact = false;
+            println!("[LoC]      Contact restored.");
+        }
+    }
+}
+
+
+// =============================================================================
+//  FAULT MANAGER  (Lab 3: interlock latency timing)
+//
+//  Monitors the fault_active flag and measures how long it takes from
+//  fault detection to interlock engagement (Lab 3 latency measurement).
+//  If the interlock takes longer than FAULT_RESPONSE_LIMIT_MS → critical alert.
+// =============================================================================
+
+async fn fault_manager_task(
+    state:    Arc<Mutex<GcsState>>,
+    metrics:  Arc<Mutex<GcsMetrics>>,
+    shutdown: CancellationToken,
+)
+{
+    println!("[FaultMgr] Manager  response_limit={}ms", FAULT_RESPONSE_LIMIT_MS);
+
+    loop
+    {
+        // Lab 8: select between shutdown and polling interval
+        tokio::select!
+        {
+            _ = shutdown.cancelled() =>
+            {
+                println!("[FaultMgr] Exit.");
+                return;
+            }
+            _ = sleep(Duration::from_millis(50)) => {}
+        }
+
+        // Only act if a fault is currently active
+        if !state.lock().unwrap().fault_active { continue; }
+
+        if let Some(t0) = state.lock().unwrap().fault_detected_at
+        {
+            // Lab 3: measure interlock response latency
+            let interlock_ms = t0.elapsed().as_millis() as u64;
+            metrics.lock().unwrap().interlock_latency_ms.push(interlock_ms);
+
+            if interlock_ms > FAULT_RESPONSE_LIMIT_MS
+            {
+                let alert = format!(
+                    "[{}ms] !!! CRITICAL ALERT !!! Interlock {interlock_ms}ms > {FAULT_RESPONSE_LIMIT_MS}ms",
+                    now_ms()
+                );
+                println!("{alert}");
+                metrics.lock().unwrap().critical_alerts.push(alert);
+
+                // Auto-clear the interlock after logging
+                let mut s = state.lock().unwrap();
+                s.fault_active      = false;
+                s.fault_detected_at = None;
+                println!("[FaultMgr] Interlock auto-cleared.");
+            }
+        }
+    }
+}
+
+
+// =============================================================================
+//  PART 2 — COMMAND UPLINK TASKS  (Rate Monotonic + Lab 7 typestate)
+//
+//  Three tasks with different periods following Rate Monotonic scheduling.
+//  Shorter period = higher priority = runs more often.
+//
+//  Each task follows this pattern:
+//    1. tokio::select! { shutdown | sleep(period) }           (Lab 8)
+//    2. Check fault_active — reject if faulted                (Lab 7)
+//    3. Construct GcsMode::<Normal>::new() only when OK        (Lab 7)
+//    4. Call dispatch_command(&mode, ...) — compile enforced   (Lab 7)
+//    5. Encode command with serde_json::to_string(&GcsCmd{..}) (serde)
+//    6. Measure and record jitter                             (Lab 2)
+// =============================================================================
+
+// ── Thermal Check (RM P1) — fires every 50ms ─────────────────────────────────
+async fn thermal_command_task(
+    cmd_tx:   mpsc::Sender<UplinkCmd>,
+    state:    Arc<Mutex<GcsState>>,
+    metrics:  Arc<Mutex<GcsMetrics>>,
+    shutdown: CancellationToken,
+)
+{
+    // This is the heartbeat() pattern from Lab 6 — a periodic async task
+    println!("[ThermalCmd] period={}ms  RM-P1", THERMAL_CMD_PERIOD_MS);
+
     let mut iter:   u64     = 0;
     let task_start: Instant = Instant::now();
 
     loop
     {
-        sleep(Duration::from_millis(CMD_SCHEDULE_PERIOD_MS)).await;
+        let t0 = Instant::now();
 
-        // lab 7 — rand::random_range, lab 8 — 2% panic chance (fragile_worker)
-        if rand::random_range(0u32..100) < 2
+        // Lab 8: wait for either shutdown OR the period timer
+        tokio::select!
         {
-            println!("[Uplink-{generation}]  Radio hardware fault — panicking!");
-            panic!("Uplink radio fault (generation {generation})");
+            _ = shutdown.cancelled() =>
+            {
+                println!("[ThermalCmd] Exit.");
+                return;
+            }
+            _ = sleep(Duration::from_millis(THERMAL_CMD_PERIOD_MS)) => {}
         }
 
-        let expected_ms = iter * CMD_SCHEDULE_PERIOD_MS;
+        // ── Jitter Calculation (Lab 2) ────────────────────────────────────────
+        let expected_ms = iter * THERMAL_CMD_PERIOD_MS;
         let actual_ms   = task_start.elapsed().as_millis() as u64;
         let drift_ms    = actual_ms as i64 - expected_ms as i64;
 
-        // Check interlock state — lab 7 match on InterlockState enum
-        let il_state = interlock.lock().unwrap().clone();
-
-        // Drain one command per tick  (lab 11 — queue.lock().unwrap().pop())
-        let cmd = cmd_queue.lock().unwrap().pop();
-
-        if let Some(c) = cmd
+        // ── Lab 7: Typestate gate — only dispatch if not faulted ─────────────
+        if state.lock().unwrap().fault_active
         {
-            let now = now_ms();
+            let rej = format!(
+                "[{}ms] [REJECT] ThermalCheck iter={iter} — FaultLocked",
+                now_ms()
+            );
+            println!("{rej}");
+            let mut m = metrics.lock().unwrap();
+            m.commands_rejected += 1;
+            m.rejection_log.push(rej);
+            iter += 1;
+            continue;  // skip dispatch_command entirely
+        }
 
-            // lab 7 — match on state, same pattern as match read_sensor()
-            let result = match il_state
-            {
-                InterlockState::Clear =>
-                {
-                    if now > c.deadline_ms
-                    {
-                        UplinkResult::DeadlineMissed
-                    }
-                    else
-                    {
-                        // lab 9 — publish command to OCS
-                        let topic   = format!("gcs/{}/commands", STUDENT_ID);
-                        let payload = format!(
-                            "{{\"id\":{},\"cmd\":\"{}\",\"prio\":{}}}",
-                            c.id, c.command, c.priority
-                        );
-                        match mqtt_client
-                            .publish(&topic, QoS::AtMostOnce, false, payload.as_bytes())
-                            .await
-                        {
-                            Ok(_)  => UplinkResult::Sent,
-                            Err(e) => UplinkResult::Blocked(format!("publish error: {e}")),
-                        }
-                    }
-                }
-                InterlockState::FaultActive =>
-                {
-                    UplinkResult::Blocked("interlock: fault active".into())
-                }
-                InterlockState::CriticalAlert =>
-                {
-                    UplinkResult::Blocked("interlock: CRITICAL ALERT".into())
-                }
-            };
+        // Construct Normal mode ONLY when fault_active is false.
+        // The type system makes it impossible to pass this to dispatch_command
+        // if we were in the fault branch above.
+        let mode = GcsMode::<Normal>::new();
 
-            // lab 7 — match on UplinkResult, mirrors match on SensorError
-            {
-                let mut m = metrics.lock().unwrap();
-                match &result
-                {
-                    UplinkResult::Sent =>
-                    {
-                        m.cmds_sent += 1;
-                        println!(
-                            "[Uplink-{generation}]  CMD #{} '{}' sent  drift={drift_ms:+}ms",
-                            c.id, c.command
-                        );
-                    }
-                    UplinkResult::Blocked(reason) =>
-                    {
-                        m.cmds_blocked += 1;
-                        let log = format!(
-                            "[{}ms] [BLOCKED] CMD #{} '{}' — {reason}",
-                            now_ms(), c.id, c.command
-                        );
-                        println!("{log}");
-                        m.cmd_log.push(log);
-                    }
-                    UplinkResult::DeadlineMissed =>
-                    {
-                        m.cmds_deadline_miss += 1;
-                        let log = format!(
-                            "[{}ms] [DEADLINE] CMD #{} '{}' expired",
-                            now_ms(), c.id, c.command
-                        );
-                        println!("{log}");
-                        m.cmd_log.push(log);
-                    }
-                }
+        // serde: build a typed command struct, no manual JSON string escaping
+        let payload = encode_cmd(&GcsCmd
+        {
+            tag:      "cmd".into(),
+            student:  STUDENT_ID.into(),
+            cmd:      "ThermalCheck".into(),
+            ts:       now_ms(),
+            priority: Some(1),
+            iter:     Some(iter),
+            gen:      None,
+        });
 
-                m.task_drift_ms.push(drift_ms);
-                if drift_ms.abs() > 5
-                {
-                    let jit_us = (drift_ms * 1_000).unsigned_abs() as i64;
-                    m.task_jitter_us.push(jit_us);
-                    if jit_us > JITTER_LIMIT_US
-                    {
-                        let v = format!(
-                            "[{}ms] [WARN] Uplink jitter {}µs > {}µs limit",
-                            now_ms(), jit_us, JITTER_LIMIT_US
-                        );
-                        println!("{v}");
-                        m.cmd_log.push(v);
-                    }
-                }
-            }
+        // Lab 7: dispatch_command takes &GcsMode<Normal> — compile-time safety
+        dispatch_command(&mode, &cmd_tx, payload, 1);
+
+        let jitter_us = (drift_ms * 1_000).unsigned_abs() as i64;
+
+        if jitter_us > UPLINK_JITTER_LIMIT_US
+        {
+            let v = format!(
+                "[{}ms] [WARN] ThermalCmd jitter {jitter_us}µs iter={iter}",
+                now_ms()
+            );
+            println!("{v}");
+            metrics.lock().unwrap().deadline_violations.push(v);
+        }
+
+        {
+            let mut m = metrics.lock().unwrap();
+            m.thermal_jitter_us.push(jitter_us);
+            m.drift_ms.push(drift_ms);
+            m.active_ms  += t0.elapsed().as_millis() as u64;
+            m.elapsed_ms  = task_start.elapsed().as_millis() as u64;
+        }
+
+        if iter % 20 == 0
+        {
+            println!(
+                "[ThermalCmd] iter={iter:>4}  drift={drift_ms:+}ms  jitter={jitter_us}µs"
+            );
         }
 
         iter += 1;
     }
 }
 
-// ── Lab 8 Part 2 — uplink supervisor ──────────────────────────────────────────
-// Mirrors the supervisor loop from lab 8 Part 2.
-// Restarts fragile_uplink on panic with a backoff.
-async fn uplink_supervisor_task(
-    cmd_queue:   Arc<Mutex<Vec<Command>>>,
-    metrics:     Arc<Mutex<GcsMetrics>>,
-    interlock:   Arc<Mutex<InterlockState>>,
-    mqtt_client: AsyncClient,
-    shutdown:    CancellationToken,
+// ── Velocity Check (RM P2) — fires every 120ms ────────────────────────────────
+async fn velocity_command_task(
+    cmd_tx:   mpsc::Sender<UplinkCmd>,
+    state:    Arc<Mutex<GcsState>>,
+    metrics:  Arc<Mutex<GcsMetrics>>,
+    shutdown: CancellationToken,
 )
 {
-    println!("[UL-SUP]   Uplink supervisor online.");
+    println!("[VelocityCmd] period={}ms  RM-P2", VELOCITY_CMD_PERIOD_MS);
+
+    let mut iter:   u64     = 0;
+    let task_start: Instant = Instant::now();
+
+    loop
+    {
+        let t0 = Instant::now();
+
+        tokio::select!
+        {
+            _ = shutdown.cancelled() =>
+            {
+                println!("[VelocityCmd] Exit.");
+                return;
+            }
+            _ = sleep(Duration::from_millis(VELOCITY_CMD_PERIOD_MS)) => {}
+        }
+
+        let expected_ms = iter * VELOCITY_CMD_PERIOD_MS;
+        let actual_ms   = task_start.elapsed().as_millis() as u64;
+        let drift_ms    = actual_ms as i64 - expected_ms as i64;
+
+        // Lab 7: reject if faulted
+        if state.lock().unwrap().fault_active
+        {
+            let rej = format!(
+                "[{}ms] [REJECT] VelocityCheck iter={iter} — FaultLocked",
+                now_ms()
+            );
+            println!("{rej}");
+            let mut m = metrics.lock().unwrap();
+            m.commands_rejected += 1;
+            m.rejection_log.push(rej);
+            iter += 1;
+            continue;
+        }
+
+        let mode    = GcsMode::<Normal>::new();
+        let payload = encode_cmd(&GcsCmd
+        {
+            tag:      "cmd".into(),
+            student:  STUDENT_ID.into(),
+            cmd:      "VelocityCheck".into(),
+            ts:       now_ms(),
+            priority: Some(2),
+            iter:     Some(iter),
+            gen:      None,
+        });
+
+        dispatch_command(&mode, &cmd_tx, payload, 2);
+
+        let jitter_us = (drift_ms * 1_000).unsigned_abs() as i64;
+        {
+            let mut m = metrics.lock().unwrap();
+            m.velocity_jitter_us.push(jitter_us);
+            m.drift_ms.push(drift_ms);
+            m.active_ms += t0.elapsed().as_millis() as u64;
+        }
+
+        if iter % 8 == 0
+        {
+            println!(
+                "[VelocityCmd] iter={iter:>4}  drift={drift_ms:+}ms  jitter={jitter_us}µs"
+            );
+        }
+
+        iter += 1;
+    }
+}
+
+
+// =============================================================================
+//  LAB 8 PART 1 — FRAGILE ATTITUDE DISPATCHER
+//
+//  This is the fragile_worker pattern from Lab 8 applied to an async task.
+//  It has a 2% random chance of panicking each iteration, simulating a
+//  transmitter hardware glitch.
+//
+//  Like fragile_gyroscope in OCS, it runs in an infinite loop — the
+//  supervisor detects the panic and restarts it.
+// =============================================================================
+
+async fn fragile_attitude_dispatcher(
+    generation: u32,
+    cmd_tx:     mpsc::Sender<UplinkCmd>,
+    state:      Arc<Mutex<GcsState>>,
+    metrics:    Arc<Mutex<GcsMetrics>>,
+)
+{
+    println!(
+        "[AttCmd-{generation}]  period={}ms  RM-P3  fragile",
+        ATTITUDE_CMD_PERIOD_MS
+    );
+
+    let mut iter:   u64     = 0;
+    let task_start: Instant = Instant::now();
+
+    loop
+    {
+        // Lab 6: async sleep — yields execution so other tasks can run
+        sleep(Duration::from_millis(ATTITUDE_CMD_PERIOD_MS)).await;
+
+        // Lab 8: 2% random panic (fragile_worker pattern from Lab 8)
+        if rand::random_range(0u32..100) < 2
+        {
+            println!("[AttCmd-{generation}]  Transmitter glitch — panicking!");
+            panic!("Attitude dispatcher fault (gen {generation})");
+            // attitude_supervisor_task catches this via handle.await returning Err
+        }
+
+        let expected_ms = iter * ATTITUDE_CMD_PERIOD_MS;
+        let actual_ms   = task_start.elapsed().as_millis() as u64;
+        let drift_ms    = actual_ms as i64 - expected_ms as i64;
+
+        // Lab 7: reject if faulted
+        if state.lock().unwrap().fault_active
+        {
+            let rej = format!(
+                "[{}ms] [REJECT] AttitudeCheck gen={generation} iter={iter}",
+                now_ms()
+            );
+            println!("{rej}");
+            let mut m = metrics.lock().unwrap();
+            m.commands_rejected += 1;
+            m.rejection_log.push(rej);
+            iter += 1;
+            continue;
+        }
+
+        let mode    = GcsMode::<Normal>::new();
+        let payload = encode_cmd(&GcsCmd
+        {
+            tag:      "cmd".into(),
+            student:  STUDENT_ID.into(),
+            cmd:      "AttitudeCheck".into(),
+            ts:       now_ms(),
+            priority: Some(3),
+            iter:     Some(iter),
+            gen:      Some(generation),
+        });
+
+        dispatch_command(&mode, &cmd_tx, payload, 3);
+
+        let jitter_us = (drift_ms * 1_000).unsigned_abs() as i64;
+        {
+            let mut m = metrics.lock().unwrap();
+            m.attitude_jitter_us.push(jitter_us);
+            m.drift_ms.push(drift_ms);
+        }
+
+        if iter % 3 == 0
+        {
+            println!(
+                "[AttCmd-{generation}]  iter={iter:>4}  drift={drift_ms:+}ms  jitter={jitter_us}µs"
+            );
+        }
+
+        iter += 1;
+    }
+}
+
+
+// =============================================================================
+//  LAB 8 PART 2 — ATTITUDE SUPERVISOR  (async version of Lab 8 supervisor)
+//
+//  Mirrors the gyro_supervisor_thread in OCS, but runs as a Tokio task.
+//  Uses tokio::spawn instead of thread::spawn, and .await instead of .join().
+//
+//  Lab 8 match pattern:
+//    match handle.await {
+//        Ok(_)              => normal exit
+//        Err(e) if e.is_panic() => restart after backoff
+//        Err(_)             => cancelled
+//    }
+// =============================================================================
+
+async fn attitude_supervisor_task(
+    cmd_tx:   mpsc::Sender<UplinkCmd>,
+    state:    Arc<Mutex<GcsState>>,
+    metrics:  Arc<Mutex<GcsMetrics>>,
+    shutdown: CancellationToken,
+)
+{
+    println!("[AttSup]   Supervisor online.");
+
     let mut generation: u32 = 0;
 
     loop
     {
-        if shutdown.is_cancelled() { println!("[UL-SUP]   Exit."); return; }
+        // Check if we should exit before spawning a new generation
+        if shutdown.is_cancelled()
+        {
+            println!("[AttSup]   Exit.");
+            return;
+        }
 
         generation += 1;
-        println!("[UL-SUP]   Starting uplink generation {generation}...");
+        println!("[AttSup]   Starting generation {generation}...");
 
-        // lab 8 — spawn + await
-        let handle = tokio::spawn(fragile_uplink(
+        // Lab 8: spawn the fragile dispatcher as a new async task
+        let handle = tokio::spawn(fragile_attitude_dispatcher(
             generation,
-            Arc::clone(&cmd_queue),  // lab 2 — Arc::clone
+            cmd_tx.clone(),
+            Arc::clone(&state),
             Arc::clone(&metrics),
-            Arc::clone(&interlock),
-            mqtt_client.clone(),
         ));
 
-        // lab 8 — match handle.await { Err(e) if e.is_panic() }
+        // Lab 8: match handle.await to detect panic vs normal exit
         match handle.await
         {
-            Ok(_) => { println!("[UL-SUP]   Uplink exited normally."); return; }
+            Ok(_) =>
+            {
+                // Normal exit — shouldn't happen in loop{}, means it was cancelled
+                println!("[AttSup]   Normal exit — done.");
+                return;
+            }
             Err(e) if e.is_panic() =>
             {
-                metrics.lock().unwrap().uplink_restarts += 1;
-                println!("[UL-SUP]   Uplink panicked! Restarting in 1s...");
-                sleep(Duration::from_secs(1)).await; // backoff — lab 8 pattern
+                // Panic detected — same restart logic as Lab 8
+                metrics.lock().unwrap().attitude_restarts += 1;
+                println!("[AttSup]   Panic! Restarting in 1s...");
+
+                // Lab 8: backoff before restarting
+                sleep(Duration::from_secs(1)).await;
             }
-            Err(_) => { println!("[UL-SUP]   Uplink cancelled — exit."); return; }
+            Err(_) =>
+            {
+                // Cancelled — clean exit
+                println!("[AttSup]   Cancelled.");
+                return;
+            }
         }
     }
 }
 
-// =============================================================================
-//  GCS HEALTH MONITOR   (RM P1 — 200ms)
-// =============================================================================
-
-async fn gcs_health_monitor_task(
-    backlog:   Arc<Mutex<VecDeque<TelemetryPacket>>>,
-    metrics:   Arc<Mutex<GcsMetrics>>,
-    interlock: Arc<Mutex<InterlockState>>,
-    shutdown:  CancellationToken,
-)
-{
-    println!("[GCS-HLT]  Health monitor  period={}ms  RM P1", HEALTH_PERIOD_MS);
-    let mut iter:   u64     = 0;
-    let task_start: Instant = Instant::now();
-
-    loop
-    {
-        // lab 8 — select!
-        tokio::select!
-        {
-            _ = shutdown.cancelled() => { println!("[GCS-HLT]  Exit."); return; }
-            _ = sleep(Duration::from_millis(HEALTH_PERIOD_MS)) => {}
-        }
-
-        let expected_ms = iter * HEALTH_PERIOD_MS;
-        let actual_ms   = task_start.elapsed().as_millis() as u64;
-        let drift_ms    = actual_ms as i64 - expected_ms as i64;
-
-        let depth    = backlog.lock().unwrap().len();
-        let il_state = interlock.lock().unwrap().clone();
-
-        println!(
-            "[GCS-HLT]  iter={iter:>4}  backlog={depth:>3}  \
-             interlock={il_state:?}  drift={drift_ms:+}ms"
-        );
-
-        {
-            let mut m = metrics.lock().unwrap();
-            m.backlog_samples.push(depth);
-            m.task_drift_ms.push(drift_ms);
-            if drift_ms.abs() > 5
-            {
-                m.task_jitter_us.push((drift_ms * 1_000).unsigned_abs() as i64);
-            }
-        }
-
-        if depth >= BACKLOG_WARN_THRESHOLD
-        {
-            println!("[GCS-HLT]  WARNING: backlog {} >= warn threshold {}",
-                depth, BACKLOG_WARN_THRESHOLD);
-        }
-
-        iter += 1;
-    }
-}
 
 // =============================================================================
-//  UPLINK MONITOR   (RM P2 — 1000ms)
-//  Generates periodic command schedule and enqueues validated commands.
-// =============================================================================
-
-async fn uplink_monitor_task(
-    cmd_queue:  Arc<Mutex<Vec<Command>>>,
-    backlog:    Arc<Mutex<VecDeque<TelemetryPacket>>>,
-    metrics:    Arc<Mutex<GcsMetrics>>,
-    interlock:  Arc<Mutex<InterlockState>>,
-    shutdown:   CancellationToken,
-)
-{
-    println!("[UL-MON]   Uplink monitor  period={}ms  RM P2", MONITOR_PERIOD_MS);
-    let mut iter:   u64     = 0;
-    let task_start: Instant = Instant::now();
-
-    // Predefined RM command schedule — cycles at each iteration
-    // (lab 1 — array, lab 1 — tuples)
-    let schedule: [(&str, u8); 6] =
-    [
-        ("HEARTBEAT",         1),
-        ("REQUEST_TELEMETRY", 2),
-        ("ADJUST_ANTENNA",    2),
-        ("STATUS_QUERY",      1),
-        ("THERMAL_CHECK",     1),
-        ("ADJUST_GAIN",       3),
-    ];
-
-    loop
-    {
-        // lab 8 — select!
-        tokio::select!
-        {
-            _ = shutdown.cancelled() => { println!("[UL-MON]   Exit."); return; }
-            _ = sleep(Duration::from_millis(MONITOR_PERIOD_MS)) => {}
-        }
-
-        let expected_ms = iter * MONITOR_PERIOD_MS;
-        let actual_ms   = task_start.elapsed().as_millis() as u64;
-        let drift_ms    = actual_ms as i64 - expected_ms as i64;
-
-        // Drain processed telemetry from backlog  (lab 11 pop pattern)
-        {
-            let mut bl = backlog.lock().unwrap();
-            for _ in 0..5 { if bl.pop_front().is_none() { break; } }
-        }
-
-        // Generate next scheduled command
-        let (cmd_name, priority) = schedule[(iter as usize) % schedule.len()];
-        let cmd = Command
-        {
-            id:          iter,
-            command:     cmd_name.to_string(),
-            priority,
-            deadline_ms: now_ms() + 2_000,
-        };
-
-        // Validate against interlock before queuing  (lab 7 match)
-        let il_state = interlock.lock().unwrap().clone();
-        match il_state
-        {
-            InterlockState::Clear =>
-            {
-                println!(
-                    "[UL-MON]   Queuing CMD #{} '{cmd_name}' prio={priority} \
-                     drift={drift_ms:+}ms",
-                    iter
-                );
-                cmd_queue.lock().unwrap().push(cmd);
-            }
-            InterlockState::FaultActive | InterlockState::CriticalAlert =>
-            {
-                let log = format!(
-                    "[{}ms] [BLOCKED] CMD #{} '{cmd_name}' — interlock: {il_state:?}",
-                    now_ms(), iter
-                );
-                println!("{log}");
-                let mut m = metrics.lock().unwrap();
-                m.cmds_blocked += 1;
-                m.cmd_log.push(log);
-            }
-        }
-
-        metrics.lock().unwrap().task_drift_ms.push(drift_ms);
-        iter += 1;
-    }
-}
-
-// =============================================================================
-//  PART 3 — FAULT MANAGEMENT AND INTERLOCKS   (RM P3 — 2000ms)
+//  METRICS REPORTER
 //
-//  Scans the interlock state, times fault duration (lab 3 Instant),
-//  clears the interlock after simulated recovery, and escalates to
-//  CriticalAlert when recovery exceeds the 100ms assignment threshold.
-//  Uses lab 7's consecutive-miss counter pattern.
-// =============================================================================
-
-async fn fault_manager_task(
-    metrics:   Arc<Mutex<GcsMetrics>>,
-    interlock: Arc<Mutex<InterlockState>>,
-    shutdown:  CancellationToken,
-)
-{
-    println!("[FAULT-MGR] Fault manager  period={}ms  RM P3", ALERT_PERIOD_MS);
-    let mut iter:          u64          = 0;
-    let task_start:        Instant      = Instant::now();
-    let mut fault_started: Option<Instant> = None;
-    let mut missed_count:  u32          = 0; // lab 7 — consecutive miss counter
-
-    loop
-    {
-        // lab 8 — select!
-        tokio::select!
-        {
-            _ = shutdown.cancelled() => { println!("[FAULT-MGR] Exit."); return; }
-            _ = sleep(Duration::from_millis(ALERT_PERIOD_MS)) => {}
-        }
-
-        let expected_ms = iter * ALERT_PERIOD_MS;
-        let actual_ms   = task_start.elapsed().as_millis() as u64;
-        let drift_ms    = actual_ms as i64 - expected_ms as i64;
-
-        let il_state = interlock.lock().unwrap().clone();
-
-        // lab 7 — match on InterlockState, mirrors run_sensor_loop()
-        match il_state
-        {
-            InterlockState::Clear =>
-            {
-                // lab 7 — reset counter on success (glitch_count pattern)
-                missed_count  = 0;
-                fault_started = None;
-            }
-
-            InterlockState::FaultActive =>
-            {
-                missed_count += 1;
-
-                // Start the fault clock if this is the first tick  (lab 3 Instant)
-                let t0 = fault_started.get_or_insert_with(Instant::now);
-                let elapsed_ms = t0.elapsed().as_millis() as u64;
-
-                metrics.lock().unwrap().interlock_latency_ms.push(elapsed_ms);
-
-                println!(
-                    "[FAULT-MGR] Fault active for {}ms  consec={}  drift={drift_ms:+}ms",
-                    elapsed_ms, missed_count
-                );
-
-                // Attempt recovery after 3 consecutive fault scans  (lab 7 threshold)
-                if missed_count >= 3
-                {
-                    println!("[FAULT-MGR] Attempting recovery...");
-                    sleep(Duration::from_millis(60)).await; // simulated subsystem reset
-
-                    let total_ms = fault_started
-                        .map(|t| t.elapsed().as_millis() as u64)
-                        .unwrap_or(0);
-
-                    {
-                        let mut m = metrics.lock().unwrap();
-                        m.fault_recovery_ms.push(total_ms);
-
-                        if total_ms > GROUND_ALERT_LIMIT_MS
-                        {
-                            // Escalate — assignment says trigger critical ground alert
-                            *interlock.lock().unwrap() = InterlockState::CriticalAlert;
-                            let alert = format!(
-                                "[{}ms] !!! CRITICAL GROUND ALERT !!! \
-                                 Recovery {}ms > {}ms limit",
-                                now_ms(), total_ms, GROUND_ALERT_LIMIT_MS
-                            );
-                            println!("{alert}");
-                            m.ground_alerts.push(alert);
-                        }
-                        else
-                        {
-                            // Recovery succeeded — clear interlock
-                            *interlock.lock().unwrap() = InterlockState::Clear;
-                            println!(
-                                "[FAULT-MGR] Recovery complete in {total_ms}ms — \
-                                 interlock cleared."
-                            );
-                            missed_count  = 0;
-                            fault_started = None;
-                        }
-                    }
-                }
-            }
-
-            InterlockState::CriticalAlert =>
-            {
-                // In production this requires operator intervention.
-                // For simulation, auto-clear after 5 seconds.
-                println!("[FAULT-MGR] CRITICAL ALERT active — awaiting operator clearance...");
-                sleep(Duration::from_secs(5)).await;
-                *interlock.lock().unwrap() = InterlockState::Clear;
-                println!("[FAULT-MGR] Critical alert cleared (simulated clearance).");
-                missed_count  = 0;
-                fault_started = None;
-            }
-        }
-
-        {
-            let mut m = metrics.lock().unwrap();
-            m.task_drift_ms.push(drift_ms);
-            if drift_ms.abs() > 20
-            {
-                m.task_jitter_us.push((drift_ms * 1_000).unsigned_abs() as i64);
-            }
-        }
-
-        iter += 1;
-    }
-}
-
-// =============================================================================
-//  PART 4 — SYSTEM PERFORMANCE MONITORING   (live report every 10s)
+//  Prints a formatted summary report every 10 seconds.
+//  Lab 6: runs as a tokio::spawn'd async task alongside all others.
 // =============================================================================
 
 async fn metrics_reporter_task(
     metrics:  Arc<Mutex<GcsMetrics>>,
+    state:    Arc<Mutex<GcsState>>,
     shutdown: CancellationToken,
 )
 {
@@ -958,81 +1356,114 @@ async fn metrics_reporter_task(
             _ = shutdown.cancelled() => return,
             _ = sleep(Duration::from_secs(10)) => {}
         }
-        print_report(&metrics.lock().unwrap());
+
+        print_report(&metrics.lock().unwrap(), &state.lock().unwrap());
     }
 }
 
-fn print_report(m: &GcsMetrics)
+fn print_report(m: &GcsMetrics, s: &GcsState)
 {
-    let decode_pct = if m.pkts_received > 0
-        { m.pkts_decoded as f64 / m.pkts_received as f64 * 100.0 }
-        else { 0.0 };
+    let reject_pct = if m.commands_sent + m.commands_rejected > 0
+    {
+        m.commands_rejected as f64
+            / (m.commands_sent + m.commands_rejected) as f64
+            * 100.0
+    }
+    else
+    {
+        0.0
+    };
 
-    let avg_backlog = if m.backlog_samples.is_empty() { 0.0 }
-        else
-        {
-            m.backlog_samples.iter().sum::<usize>() as f64
-                / m.backlog_samples.len() as f64
-        };
+    let cpu = if m.elapsed_ms > 0
+    {
+        m.active_ms as f64 / m.elapsed_ms as f64 * 100.0
+    }
+    else
+    {
+        0.0
+    };
 
     println!("\n╔══════════════════════════════════════════════════════╗");
-    println!(  "║  GCS LIVE REPORT  at {}ms", now_ms());
-    println!(  "╠══════════════════════════════════════════════════════╣");
-    println!("║  Telemetry pipeline");
-    println!("║    Received: {}  Decoded: {} ({:.1}%)  Avg backlog: {:.1}  Uplink restarts: {}",
-        m.pkts_received, m.pkts_decoded, decode_pct, avg_backlog, m.uplink_restarts);
-    println!("║");
-    println!("║  Link Jitter (µs)  — inter-packet arrival variance");
-    print_stat_row("Link jitter", &m.link_jitter_us);
-    println!("║");
-    println!("║  Decode Latency (µs)  deadline={}ms", DECODE_DEADLINE_MS);
+    println!( "║  GCS REPORT  at {}ms", now_ms());
+    println!( "╠══════════════════════════════════════════════════════╣");
+    println!(
+        "║  Mode: {}  LoC: {}  Att restarts: {}",
+        if s.fault_active { "FaultLocked" } else { "Normal" },
+        s.loss_of_contact,
+        m.attitude_restarts
+    );
+    println!(
+        "║  Telemetry: rx={}  missed={}",
+        m.telemetry_received, m.missed_packets
+    );
+    println!(
+        "║  Decode latency (µs)  deadline={}ms  (spawn_blocking)",
+        DECODE_DEADLINE_MS
+    );
     let dl: Vec<i64> = m.decode_latency_us.iter().map(|&v| v as i64).collect();
-    print_stat_row("MQTT recv to decode done", &dl);
-    println!("║");
-    println!("║  Reception Drift (ms)  — actual vs expected interval");
-    print_stat_row("Inter-packet drift", &m.reception_drift_ms);
-    println!("║");
-    println!("║  Task Execution (GCS RM tasks)");
-    print_stat_row("Task jitter (µs)", &m.task_jitter_us);
-    print_stat_row("Task drift (ms)",  &m.task_drift_ms);
-    println!("║");
-    println!("║  Command Uplink");
-    println!("║    Sent: {}  Blocked: {}  Deadline misses: {}",
-        m.cmds_sent, m.cmds_blocked, m.cmds_deadline_miss);
-    println!("║");
-    println!("║  Fault Management");
-    println!("║    Faults from OCS: {}  Ground alerts: {}",
-        m.faults_received, m.ground_alerts.len());
-    if !m.fault_recovery_ms.is_empty()
-    {
-        let max_r = m.fault_recovery_ms.iter().max().unwrap();
-        let avg_r = m.fault_recovery_ms.iter().sum::<u64>() as f64
-                    / m.fault_recovery_ms.len() as f64;
-        println!("║  Recovery: max={}ms  avg={avg_r:.1}ms  limit={}ms",
-            max_r, GROUND_ALERT_LIMIT_MS);
-    }
+    print_stat_row("Decode (µs)", &dl);
+    println!(
+        "║  Commands  sent={}  rejected={} ({:.1}%)",
+        m.commands_sent, m.commands_rejected, reject_pct
+    );
+    println!(
+        "║  Dispatch latency (µs)  deadline={}ms",
+        DISPATCH_DEADLINE_MS
+    );
+    let disp: Vec<i64> = m.dispatch_latency_us.iter().map(|&v| v as i64).collect();
+    print_stat_row("Dispatch (µs)", &disp);
+    println!("║  Uplink jitter (µs)  limit={}µs", UPLINK_JITTER_LIMIT_US);
+    print_stat_row("ThermalCheck  RM-P1",  &m.thermal_jitter_us);
+    print_stat_row("VelocityCheck RM-P2",  &m.velocity_jitter_us);
+    print_stat_row("AttitudeCheck RM-P3",  &m.attitude_jitter_us);
+    println!("║  Drift (ms)");
+    print_stat_row("All tasks", &m.drift_ms);
+    println!(
+        "║  Faults: {}  Critical alerts: {}",
+        m.faults_received, m.critical_alerts.len()
+    );
     if !m.interlock_latency_ms.is_empty()
     {
         let il: Vec<i64> = m.interlock_latency_ms.iter().map(|&v| v as i64).collect();
         print_stat_row("Interlock latency (ms)", &il);
     }
-    if !m.ground_alerts.is_empty()
+    println!("║  Deadline violations: {}", m.deadline_violations.len());
+    for v in m.deadline_violations.iter().take(3)
     {
-        println!("║");
-        println!("║  CRITICAL GROUND ALERTS:");
-        for a in &m.ground_alerts { println!("║    {a}"); }
+        println!("║    {v}");
     }
-    if !m.cmd_log.is_empty()
+    if m.deadline_violations.len() > 3
     {
-        println!("║");
-        println!("║  Recent events ({} total):", m.cmd_log.len());
-        for e in m.cmd_log.iter().rev().take(4) { println!("║    {e}"); }
+        println!("║    ... and {} more", m.deadline_violations.len() - 3);
+    }
+    if !m.rejection_log.is_empty()
+    {
+        println!("║  Rejections: {}", m.rejection_log.len());
+        for r in m.rejection_log.iter().take(2)
+        {
+            println!("║    {r}");
+        }
+    }
+    println!("║  CPU ≈ {cpu:.2}%");
+    if !m.critical_alerts.is_empty()
+    {
+        println!("║  CRITICAL ALERTS:");
+        for a in &m.critical_alerts
+        {
+            println!("║    {a}");
+        }
     }
     println!("╚══════════════════════════════════════════════════════╝\n");
 }
 
+
 // =============================================================================
-//  MAIN   (lab 6 — #[tokio::main] + tokio::spawn)
+//  MAIN FUNCTION   (Lab 6: #[tokio::main] async entry point)
+//
+//  #[tokio::main] wraps main() in a Tokio async runtime.
+//  All tasks are spawned with tokio::spawn (Lab 6) and share state
+//  via Arc<Mutex<T>> (Lab 2).
+//  Graceful shutdown is coordinated via CancellationToken (Lab 8).
 // =============================================================================
 
 #[tokio::main]
@@ -1040,95 +1471,114 @@ async fn main()
 {
     println!("╔═══════════════════════════════════════════════════════╗");
     println!("║  GCS — Ground Control Station                         ║");
-    println!("║  CT087-3-3  |  Student B  |  Soft RTS on Tokio        ║");
+    println!("║  CT087-3-3  |  Student B  |  Soft RTS / Tokio         ║");
     println!("╚═══════════════════════════════════════════════════════╝\n");
 
-    // ── Shared state  (lab 2 — Arc<Mutex<T>>)
-    let metrics   = Arc::new(Mutex::new(GcsMetrics::default()));
-    let backlog   = Arc::new(Mutex::new(VecDeque::<TelemetryPacket>::new())); // lab 11 job queue
-    let cmd_queue = Arc::new(Mutex::new(Vec::<Command>::new()));               // lab 11 job queue
-    let interlock = Arc::new(Mutex::new(InterlockState::Clear));
+    // ── Shared State Setup ────────────────────────────────────────────────────
+    // Lab 2: Arc<Mutex<T>> — shared ownership with mutual exclusion
+    let state    = Arc::new(Mutex::new(GcsState::default()));
+    let metrics  = Arc::new(Mutex::new(GcsMetrics::default()));
 
-    // ── CancellationToken  (lab 8 — graceful shutdown)
+    // Lab 8: CancellationToken — clean shutdown signal sent to all tasks
     let shutdown = CancellationToken::new();
 
-    // ── MQTT internal pipeline  (lab 11 — mpsc channel)
-    // mqtt_receiver_task produces; telemetry_decoder_task consumes
-    let (mqtt_tx, mqtt_rx) = mpsc::channel::<RawMqttMsg>(100);
+    // ── Lab 9: Async UDP Sockets ──────────────────────────────────────────────
+    // tokio::net::UdpSocket is the async version of the std::net::UdpSocket
+    // used in Lab 9's blocking server code.
+    let recv_sock = Arc::new(
+        UdpSocket::bind(GCS_TELEM_BIND)
+            .await
+            .expect("[GCS] bind recv failed")
+    );
+    let send_sock = Arc::new(
+        UdpSocket::bind("0.0.0.0:0")
+            .await
+            .expect("[GCS] bind send failed")
+    );
 
-    // ── Connect MQTT  (lab 9)
-    let mqtt_client = setup_mqtt(shutdown.clone()).await;
+    // ── Lab 11: Two mpsc channels ─────────────────────────────────────────────
+    // incoming: udp_receiver_loop → telemetry_processor_task
+    // cmd_out:  command tasks    → udp_sender_task
+    let (incoming_tx, incoming_rx) = mpsc::channel::<IncomingPacket>(100);
+    let (cmd_tx,       cmd_rx)     = mpsc::channel::<UplinkCmd>(50);
 
     println!("[GCS] Config:");
-    println!("      MQTT broker      : {MQTT_BROKER}:{MQTT_PORT}");
-    println!("      OCS topics       : ocs/{STUDENT_ID}/{{telemetry|status|downlink|alerts}}");
-    println!("      Command uplink   : gcs/{STUDENT_ID}/commands");
-    println!("      Decode deadline  : {DECODE_DEADLINE_MS}ms");
-    println!("      Ground alert at  : {GROUND_ALERT_LIMIT_MS}ms recovery");
+    println!("      Receive          : {GCS_TELEM_BIND}  (serde_json decoded)");
+    println!("      Send to          : {OCS_CMD_ADDR}  (serde_json encoded)");
+    println!("      Typestate        : GcsMode<Normal/FaultLocked>  (Lab 7 PhantomData)");
+    println!("      Decode           : spawn_blocking  (Lab 6 CPU-off-async)");
+    println!(
+        "      RM periods       : thermal={}ms  vel={}ms  att={}ms",
+        THERMAL_CMD_PERIOD_MS, VELOCITY_CMD_PERIOD_MS, ATTITUDE_CMD_PERIOD_MS
+    );
     println!("      Sim duration     : {SIM_DURATION_S}s\n");
 
-    // ── Spawn all GCS subsystems  (lab 6 — tokio::spawn)
-    // Arc::clone() on every argument — lab 2 pattern
+    // ── Lab 6: tokio::spawn for each subsystem ────────────────────────────────
+    // Each spawn creates a lightweight async task (NOT an OS thread).
+    // Tasks cooperatively yield when they call .await, allowing others to run.
 
-    // Part 1: MQTT receive + telemetry decoder pipeline
-    tokio::spawn(mqtt_receiver_task(
-        mqtt_tx, Arc::clone(&metrics), shutdown.clone(),
-    ));
-    tokio::spawn(telemetry_decoder_task(
-        mqtt_rx,
-        Arc::clone(&backlog),
-        Arc::clone(&metrics),
-        Arc::clone(&interlock),
-        shutdown.clone(),
+    // UDP receiver — listens for OCS telemetry, feeds the incoming channel
+    tokio::spawn(udp_receiver_loop(
+        Arc::clone(&recv_sock), incoming_tx, shutdown.clone()
     ));
 
-    // Part 2: lab 8 supervisor wraps the fragile uplink task
-    tokio::spawn(uplink_supervisor_task(
-        Arc::clone(&cmd_queue),
-        Arc::clone(&metrics),
-        Arc::clone(&interlock),
-        mqtt_client,
-        shutdown.clone(),
+    // UDP sender — consumes command queue, fires packets to OCS
+    tokio::spawn(udp_sender_task(
+        cmd_rx, Arc::clone(&send_sock), Arc::clone(&metrics), shutdown.clone()
     ));
 
-    // Part 2: RM background tasks in priority order
-    tokio::spawn(gcs_health_monitor_task(
-        Arc::clone(&backlog),
-        Arc::clone(&metrics),
-        Arc::clone(&interlock),
-        shutdown.clone(),
-    ));
-    tokio::spawn(uplink_monitor_task(
-        Arc::clone(&cmd_queue),
-        Arc::clone(&backlog),
-        Arc::clone(&metrics),
-        Arc::clone(&interlock),
-        shutdown.clone(),
+    // Telemetry processor — decodes packets (spawn_blocking) and routes them
+    tokio::spawn(telemetry_processor_task(
+        incoming_rx, Arc::clone(&state), Arc::clone(&metrics),
+        cmd_tx.clone(), shutdown.clone(),
     ));
 
-    // Part 3: fault manager — RM P3
+    // Loss-of-contact monitor — watchdog for telemetry silence
+    tokio::spawn(loss_of_contact_monitor_task(
+        Arc::clone(&state), Arc::clone(&metrics),
+        cmd_tx.clone(), shutdown.clone(),
+    ));
+
+    // Fault manager — measures interlock response latency
     tokio::spawn(fault_manager_task(
-        Arc::clone(&metrics),
-        Arc::clone(&interlock),
-        shutdown.clone(),
+        Arc::clone(&state), Arc::clone(&metrics), shutdown.clone(),
     ));
 
-    // Part 4: live report every 10s
+    // RM command tasks (Lab 7 typestate + Lab 8 supervisor)
+    tokio::spawn(thermal_command_task(
+        cmd_tx.clone(), Arc::clone(&state), Arc::clone(&metrics), shutdown.clone(),
+    ));
+
+    tokio::spawn(velocity_command_task(
+        cmd_tx.clone(), Arc::clone(&state), Arc::clone(&metrics), shutdown.clone(),
+    ));
+
+    // Attitude supervisor wraps the fragile dispatcher (Lab 8)
+    tokio::spawn(attitude_supervisor_task(
+        cmd_tx.clone(), Arc::clone(&state), Arc::clone(&metrics), shutdown.clone(),
+    ));
+
+    // Periodic metrics reporter
     tokio::spawn(metrics_reporter_task(
-        Arc::clone(&metrics),
-        shutdown.clone(),
+        Arc::clone(&metrics), Arc::clone(&state), shutdown.clone(),
     ));
 
-    println!("[GCS] All 8 tasks online. Running for {SIM_DURATION_S}s...\n");
+    println!("[GCS] All tasks online.  Waiting for OCS telemetry...\n");
 
-    // ── Run for SIM_DURATION_S then shut down  (lab 8 — CancellationToken)
+    // ── Run for the simulation duration ──────────────────────────────────────
     sleep(Duration::from_secs(SIM_DURATION_S)).await;
 
-    println!("\n[GCS] Time elapsed — requesting graceful shutdown...");
+    // ── Lab 8: Graceful Shutdown via CancellationToken ────────────────────────
+    // Calling shutdown.cancel() wakes every tokio::select! branch that is
+    // waiting on shutdown.cancelled() — all tasks exit cleanly.
+    println!("\n[GCS] Simulation ended — shutting down...");
     shutdown.cancel();
+
+    // Give tasks a moment to finish cleanup before printing the final report
     sleep(Duration::from_millis(500)).await;
 
+    // Print final summary
     println!("\n[GCS] FINAL REPORT:");
-    print_report(&metrics.lock().unwrap());
+    print_report(&metrics.lock().unwrap(), &state.lock().unwrap());
     println!("[GCS] Done.");
 }
