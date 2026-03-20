@@ -72,9 +72,9 @@ const DECODE_DEADLINE_MS:      u64 = 3;    // soft deadline: parse must complete
 const DISPATCH_DEADLINE_MS:    u64 = 2;    // soft deadline: command must be sent within 2ms
 const FAULT_RESPONSE_LIMIT_MS: u64 = 100;  // interlock must engage within 100ms
 const LOC_MISS_THRESHOLD:      u32 = 3;    // loss-of-contact after 3 watchdog misses
-const UPLINK_JITTER_LIMIT_US:  i64 = 2_000;  // warn if uplink jitter > 2ms
-const TELEM_WATCHDOG_MS:       u64 = 800;  // how long without telemetry before incrementing misses
-const REREQUEST_INTERVAL_MS:   u64 = 500;  // how often the LoC monitor checks
+const UPLINK_JITTER_LIMIT_US:  i64 = 2_000;  // warn if uplink jitter > 2ms // TODO: 
+const TELEM_WATCHDOG_MS:       u64 = 800;  // how long without telemetry before incrementing misses // TODO: 
+const REREQUEST_INTERVAL_MS:   u64 = 500;  // how often the LoC monitor checks // TODO: 
 
 // ── Simulation Config ─────────────────────────────────────────────────────────
 const SIM_DURATION_S: u64 = 180;
@@ -103,7 +103,7 @@ enum OcsMsg
 {
     Thermal  { student: String, seq: u64, temp: f64,    drift_ms: i64 },
     Accel    { student: String, seq: u64, mag:  f64                    },
-    Gyro     { student: String, gen: u32, seq:  u64, omega_z:    f64   },
+    Gyro     { student: String, generation: u32, seq:  u64, omega_z:    f64   },
     Status   { student: String, iter: u64, fill: f64, state: String, drift_ms: i64 },
     Downlink { student: String, pkt: u64, bytes: usize, q_lat_ms: u64  },
 
@@ -146,7 +146,7 @@ struct GcsCmd
     pub iter:     Option<u64>,  // which iteration of the task sent this
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub gen:      Option<u32>,  // which generation of the attitude dispatcher
+    pub generation:      Option<u32>,  // which generation of the attitude dispatcher
 }
 
 // Helper: serialise a GcsCmd to a JSON string.
@@ -635,7 +635,7 @@ async fn telemetry_processor_task(
                         };
 
                         // Reception drift (Lab 2: jitter formula)
-                        let drift_ms: i64 = if let Some(prev) = last_any_rx
+                        let drift_ms: i64 = if let Some(prev) = last_any_rx //TODO ???? FORMULA WRONG?
                         {
                             prev.elapsed().as_millis() as i64
                                 - THERMAL_CMD_PERIOD_MS as i64 * 10
@@ -701,10 +701,10 @@ async fn telemetry_processor_task(
                                 if s.loss_of_contact { s.loss_of_contact = false; }
                             }
 
-                            OcsMsg::Gyro { gen, seq, omega_z, .. } =>
+                            OcsMsg::Gyro { generation, seq, omega_z, .. } =>
                             {
                                 println!(
-                                    "[TelRx]    gyro     gen={gen}  seq={seq}  \
+                                    "[TelRx]    gyro     gen={generation}  seq={seq}  \
                                      ω_z={omega_z:.4}  decode={decode_us}µs"
                                 );
                                 let mut s = state.lock().unwrap();
@@ -793,7 +793,7 @@ fn handle_ocs_alert(
                 ts:       now_ms(),
                 priority: Some(1),
                 iter:     None,
-                gen:      None,
+                generation:      None,
             });
             let _ = cmd_tx.try_send(UplinkCmd
             {
@@ -898,7 +898,7 @@ async fn loss_of_contact_monitor_task(
                 ts,
                 priority: Some(1),
                 iter:     None,
-                gen:      None,
+                generation:      None,
             });
             let _ = cmd_tx.try_send(UplinkCmd
             {
@@ -1054,7 +1054,7 @@ async fn thermal_command_task(
             ts:       now_ms(),
             priority: Some(1),
             iter:     Some(iter),
-            gen:      None,
+            generation:      None,
         });
 
         // Lab 7: dispatch_command takes &GcsMode<Normal> — compile-time safety
@@ -1146,7 +1146,7 @@ async fn velocity_command_task(
             ts:       now_ms(),
             priority: Some(2),
             iter:     Some(iter),
-            gen:      None,
+            generation:      None,
         });
 
         dispatch_command(&mode, &cmd_tx, payload, 2);
@@ -1232,13 +1232,13 @@ async fn fragile_attitude_dispatcher(
         let mode    = GcsMode::<Normal>::new();
         let payload = encode_cmd(&GcsCmd
         {
-            tag:      "cmd".into(),
-            student:  STUDENT_ID.into(),
-            cmd:      "AttitudeCheck".into(),
-            ts:       now_ms(),
-            priority: Some(3),
-            iter:     Some(iter),
-            gen:      Some(generation),
+            tag:       "cmd".into(),
+            student:   STUDENT_ID.into(),
+            cmd:       "AttitudeCheck".into(),
+            ts:        now_ms(),
+            priority:  Some(3),
+            iter:      Some(iter),
+            generation:Some(generation),
         });
 
         dispatch_command(&mode, &cmd_tx, payload, 3);
