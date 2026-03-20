@@ -948,13 +948,20 @@ async fn fault_manager_task(
         }
 
         // Only act if a fault is currently active
-        if !state.lock().unwrap().fault_active { continue; }
+        if !state.lock().unwrap().fault_active { continue; }  // lock acquired and DROPPED here
 
-        if let Some(t0) = state.lock().unwrap().fault_detected_at
+        // Extract what we need in a scoped block so the lock is released immediately
+        // (lab 2 — always drop Mutex locks before doing more work)
+        let fault_detected_at = {
+            state.lock().unwrap().fault_detected_at  // lock acquired and DROPPED at end of block
+        };
+
+        if let Some(t0) = fault_detected_at  // no lock held here at all
         {
-            // Lab 3: measure interlock response latency
             let interlock_ms = t0.elapsed().as_millis() as u64;
-            metrics.lock().unwrap().interlock_latency_ms.push(interlock_ms);
+
+            // Lock metrics briefly, then release
+            metrics.lock().unwrap().interlock_latency_ms.push(interlock_ms);  // (lab 2)
 
             if interlock_ms > FAULT_RESPONSE_LIMIT_MS
             {
@@ -963,12 +970,16 @@ async fn fault_manager_task(
                     now_ms()
                 );
                 println!("{alert}");
-                metrics.lock().unwrap().critical_alerts.push(alert);
 
-                // Auto-clear the interlock after logging
-                let mut s = state.lock().unwrap();
-                s.fault_active      = false;
-                s.fault_detected_at = None;
+                // Lock metrics briefly, then release
+                metrics.lock().unwrap().critical_alerts.push(alert);  // (lab 2)
+
+                // Lock state to write — safe now because NO other lock is held
+                {
+                    let mut s = state.lock().unwrap();  // (lab 2 — Arc<Mutex<T>> write)
+                    s.fault_active      = false;
+                    s.fault_detected_at = None;
+                }  // lock released here
                 println!("[FaultMgr] Interlock auto-cleared.");
             }
         }
