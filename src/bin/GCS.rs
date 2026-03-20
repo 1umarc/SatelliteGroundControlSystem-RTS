@@ -315,6 +315,11 @@ struct GcsMetrics
 
     // Lab 8: how many times attitude supervisor restarted
     attitude_restarts: u32,
+
+    // Component 4 — backlog depth   (lab 2 — Arc<Mutex<T>> shared counter)
+    // Tracks how many packets are sitting in the incoming channel unprocessed
+    backlog_depth_samples: Vec<usize>,  // snapshot every health check tick
+    backlog_peak:          usize,       // highest depth seen during the run
 }
 
 // Runtime GCS state shared across tasks
@@ -422,6 +427,7 @@ fn classify_event(event: &str) -> OcsFaultKind
 async fn udp_receiver_loop(
     sock:        Arc<UdpSocket>,
     incoming_tx: mpsc::Sender<IncomingPacket>,  // Lab 11: producer side of channel
+    backlog_counter: Arc<Mutex<usize>>,           // NEW (lab 2)
     shutdown:    CancellationToken,              // Lab 8: cancellation signal
 )
 {
@@ -452,8 +458,17 @@ async fn udp_receiver_loop(
                         let received_at = Instant::now();
                         let payload = String::from_utf8_lossy(&buf[..len]).to_string();
 
-                        // Lab 11: send to telemetry processor via channel
-                        if incoming_tx.try_send(IncomingPacket { payload, received_at, from }).is_err()
+                        // // Lab 11: send to telemetry processor via channel
+                        // if incoming_tx.try_send(IncomingPacket { payload, received_at, from }).is_err()
+                        // {
+                        //     println!("[UDP-RX]   Channel full — packet dropped");
+                        // }
+                        if incoming_tx.try_send(IncomingPacket { payload, received_at, from }).is_ok()
+                        {
+                            // lab 2 — increment backlog counter on successful send
+                            *backlog_counter.lock().unwrap() += 1;
+                        }
+                        else
                         {
                             println!("[UDP-RX]   Channel full — packet dropped");
                         }
@@ -563,6 +578,7 @@ async fn telemetry_processor_task(
     state:    Arc<Mutex<GcsState>>,
     metrics:  Arc<Mutex<GcsMetrics>>,
     cmd_tx:   mpsc::Sender<UplinkCmd>,
+    backlog_counter: Arc<Mutex<usize>>,           // NEW (lab 2)
     shutdown: CancellationToken,
 )
 {
@@ -591,6 +607,12 @@ async fn telemetry_processor_task(
                     None => return,  // channel closed
                     Some(p) =>
                     {
+                        // lab 2 — decrement backlog counter: one packet consumed
+                        {
+                            let mut depth = backlog_counter.lock().unwrap();
+                            if *depth > 0 { *depth -= 1; }
+                        }
+
                         let arrival  = p.received_at;
                         let from     = p.from;
                         let payload  = p.payload.clone();
@@ -645,6 +667,26 @@ async fn telemetry_processor_task(
                             0
                         };
                         last_any_rx = Some(Instant::now());
+
+
+
+//                         // lab 2 — drift: actual gap since last packet (no fixed expected period needed)
+// let drift_ms: i64 = if let Some(prev) = last_any_rx
+// {
+//     prev.elapsed().as_millis() as i64  // just the actual gap — log it raw
+// }
+// else { 0 };
+// last_any_rx = Some(Instant::now());
+// ```
+
+// ### Problem 5 — the `OcsMsg` enum variants don't match the OCS
+
+// The OCS publishes MQTT payloads as JSON strings like:
+// ```
+// {"seq":5,"value":22.5,"ts":1234567890,"sensor":"thermal","priority":1}
+
+
+
 
                         // ── serde: match on typed OcsMsg variants ────────────────────────
                         // Before serde, this was: if payload.contains("\"tag\":\"alert\"") { ... }
@@ -1013,8 +1055,9 @@ async fn thermal_command_task(
     // This is the heartbeat() pattern from Lab 6 — a periodic async task
     println!("[ThermalCmd] period={}ms  RM-P1", THERMAL_CMD_PERIOD_MS);
 
-    let mut iter:   u64     = 0;
-    let task_start: Instant = Instant::now();
+    let mut iter:      u64     = 0;
+    let task_start:    Instant = Instant::now();  // lab 3 — reference for drift
+    let mut last_tick: Instant = Instant::now();  // lab 2 — previous tick for jitter
 
     loop
     {
@@ -1036,7 +1079,16 @@ async fn thermal_command_task(
         let actual_ms   = task_start.elapsed().as_millis() as u64;
         let drift_ms    = actual_ms as i64 - expected_ms as i64;
 
-        // ── Lab 7: Typestate gate — only dispatch if not faulted ─────────────
+        // ── Jitter (lab 2) — variation between consecutive intervals ─────────────
+        // HOW IT WORKS:
+        // last_tick records when the previous iteration ran.
+        // this_interval_ms = how long it actually took between ticks.
+        // jitter = |actual_interval - expected_period|
+        // If the task fires exactly on time every 50ms → jitter = 0µs
+        // If the task fires at 50ms then 53ms → jitter on tick 2 = 3000µs
+        let this_interval_ms = last_tick.elapsed().as_millis() as i64;
+        let jitter_us = ((this_interval_ms - THERMAL_CMD_PERIOD_MS as i64) * 1_000).unsigned_abs() as i64;
+        last_tick = Instant::now();
         if state.lock().unwrap().fault_active
         {
             let rej = format!(
@@ -1070,8 +1122,6 @@ async fn thermal_command_task(
 
         // Lab 7: dispatch_command takes &GcsMode<Normal> — compile-time safety
         dispatch_command(&mode, &cmd_tx, payload, 1);
-
-        let jitter_us = (drift_ms * 1_000).unsigned_abs() as i64;
 
         if jitter_us > UPLINK_JITTER_LIMIT_US
         {
@@ -1114,7 +1164,7 @@ async fn velocity_command_task(
 
     let mut iter:   u64     = 0;
     let task_start: Instant = Instant::now();
-
+    let mut last_tick: Instant = Instant::now();
     loop
     {
         let t0 = Instant::now();
@@ -1132,6 +1182,17 @@ async fn velocity_command_task(
         let expected_ms = iter * VELOCITY_CMD_PERIOD_MS;
         let actual_ms   = task_start.elapsed().as_millis() as u64;
         let drift_ms    = actual_ms as i64 - expected_ms as i64;
+
+        // ── Jitter (lab 2) — variation between consecutive intervals ─────────────
+        // HOW IT WORKS:
+        // last_tick records when the previous iteration ran.
+        // this_interval_ms = how long it actually took between ticks.
+        // jitter = |actual_interval - expected_period|
+        // If the task fires exactly on time every 50ms → jitter = 0µs
+        // If the task fires at 50ms then 53ms → jitter on tick 2 = 3000µs
+        let this_interval_ms = last_tick.elapsed().as_millis() as i64;
+        let jitter_us = ((this_interval_ms - VELOCITY_CMD_PERIOD_MS as i64) * 1_000).unsigned_abs() as i64;
+        last_tick = Instant::now();
 
         // Lab 7: reject if faulted
         if state.lock().unwrap().fault_active
@@ -1162,7 +1223,6 @@ async fn velocity_command_task(
 
         dispatch_command(&mode, &cmd_tx, payload, 2);
 
-        let jitter_us = (drift_ms * 1_000).unsigned_abs() as i64;
         {
             let mut m = metrics.lock().unwrap();
             m.velocity_jitter_us.push(jitter_us);
@@ -1207,6 +1267,7 @@ async fn fragile_attitude_dispatcher(
 
     let mut iter:   u64     = 0;
     let task_start: Instant = Instant::now();
+    let mut last_tick: Instant = Instant::now();
 
     loop
     {
@@ -1224,6 +1285,17 @@ async fn fragile_attitude_dispatcher(
         let expected_ms = iter * ATTITUDE_CMD_PERIOD_MS;
         let actual_ms   = task_start.elapsed().as_millis() as u64;
         let drift_ms    = actual_ms as i64 - expected_ms as i64;
+
+        // ── Jitter (lab 2) — variation between consecutive intervals ─────────────
+        // HOW IT WORKS:
+        // last_tick records when the previous iteration ran.
+        // this_interval_ms = how long it actually took between ticks.
+        // jitter = |actual_interval - expected_period|
+        // If the task fires exactly on time every 50ms → jitter = 0µs
+        // If the task fires at 50ms then 53ms → jitter on tick 2 = 3000µs
+        let this_interval_ms = last_tick.elapsed().as_millis() as i64;
+        let jitter_us = ((this_interval_ms - ATTITUDE_CMD_PERIOD_MS as i64) * 1_000).unsigned_abs() as i64;
+        last_tick = Instant::now();
 
         // Lab 7: reject if faulted
         if state.lock().unwrap().fault_active
@@ -1254,7 +1326,6 @@ async fn fragile_attitude_dispatcher(
 
         dispatch_command(&mode, &cmd_tx, payload, 3);
 
-        let jitter_us = (drift_ms * 1_000).unsigned_abs() as i64;
         {
             let mut m = metrics.lock().unwrap();
             m.attitude_jitter_us.push(jitter_us);
@@ -1357,6 +1428,7 @@ async fn attitude_supervisor_task(
 async fn metrics_reporter_task(
     metrics:  Arc<Mutex<GcsMetrics>>,
     state:    Arc<Mutex<GcsState>>,
+    backlog_counter: Arc<Mutex<usize>>,           // NEW (lab 2)
     shutdown: CancellationToken,
 )
 {
@@ -1366,6 +1438,14 @@ async fn metrics_reporter_task(
         {
             _ = shutdown.cancelled() => return,
             _ = sleep(Duration::from_secs(10)) => {}
+        }
+
+        // lab 2 — snapshot the current backlog depth into metrics
+        let depth = *backlog_counter.lock().unwrap();
+        {
+            let mut m = metrics.lock().unwrap();
+            m.backlog_depth_samples.push(depth);
+            if depth > m.backlog_peak { m.backlog_peak = depth; }
         }
 
         print_report(&metrics.lock().unwrap(), &state.lock().unwrap());
@@ -1393,6 +1473,19 @@ fn print_report(m: &GcsMetrics, s: &GcsState)
     {
         0.0
     };
+
+    // backlog depth report  (lab 11 — queue utilisation, lab 2 — shared state)
+    let avg_depth = if m.backlog_depth_samples.is_empty() { 0.0 }
+        else
+        {
+            m.backlog_depth_samples.iter().sum::<usize>() as f64
+                / m.backlog_depth_samples.len() as f64
+        };
+
+    println!(
+        "║  Backlog depth  avg={:.1}  peak={}  channel_cap=100",
+        avg_depth, m.backlog_peak
+    );
 
     println!("\n╔══════════════════════════════════════════════════════╗");
     println!( "║  GCS REPORT  at {}ms", now_ms());
@@ -1485,6 +1578,11 @@ async fn main()
     println!("║  CT087-3-3  |  Student B  |  Soft RTS / Tokio         ║");
     println!("╚═══════════════════════════════════════════════════════╝\n");
 
+    // lab 2 — Arc<Mutex<T>> backlog depth counter
+    // incremented by udp_receiver_loop when a packet is sent into the channel
+    // decremented by telemetry_processor_task when a packet is consumed
+    let backlog_counter: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+
     // ── Shared State Setup ────────────────────────────────────────────────────
     // Lab 2: Arc<Mutex<T>> — shared ownership with mutual exclusion
     let state    = Arc::new(Mutex::new(GcsState::default()));
@@ -1530,7 +1628,10 @@ async fn main()
 
     // UDP receiver — listens for OCS telemetry, feeds the incoming channel
     tokio::spawn(udp_receiver_loop(
-        Arc::clone(&recv_sock), incoming_tx, shutdown.clone()
+        Arc::clone(&recv_sock), 
+        incoming_tx,
+        Arc::clone(&backlog_counter),  // NEW
+        shutdown.clone()
     ));
 
     // UDP sender — consumes command queue, fires packets to OCS
@@ -1540,8 +1641,12 @@ async fn main()
 
     // Telemetry processor — decodes packets (spawn_blocking) and routes them
     tokio::spawn(telemetry_processor_task(
-        incoming_rx, Arc::clone(&state), Arc::clone(&metrics),
-        cmd_tx.clone(), shutdown.clone(),
+        incoming_rx, 
+        Arc::clone(&state), 
+        Arc::clone(&metrics),
+        cmd_tx.clone(), 
+        Arc::clone(&backlog_counter),  // NEW
+        shutdown.clone(),
     ));
 
     // Loss-of-contact monitor — watchdog for telemetry silence
@@ -1571,7 +1676,10 @@ async fn main()
 
     // Periodic metrics reporter
     tokio::spawn(metrics_reporter_task(
-        Arc::clone(&metrics), Arc::clone(&state), shutdown.clone(),
+        Arc::clone(&metrics), 
+        Arc::clone(&state), 
+        Arc::clone(&backlog_counter),  // NEW
+        shutdown.clone(),
     ));
 
     println!("[GCS] All tasks online.  Waiting for OCS telemetry...\n");
