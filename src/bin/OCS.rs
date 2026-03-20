@@ -61,29 +61,29 @@ use serde_json;                         // JSON encode/decode for UDP payloads
 
 // ── Sensor Sampling Periods (milliseconds) ────────────────────────────────────
 const GYRO_PERIOD_MS:    u64 = 20;    // highest priority sensor, fastest rate
-const ACCEL_PERIOD_MS:   u64 = 50;
+const ACCEL_PERIOD_MS:   u64 = 50; // FIXME: Accelerometer 
 const THERMAL_PERIOD_MS: u64 = 100;
 
 // ── Background Task Periods (milliseconds) ────────────────────────────────────
 const HEALTH_PERIOD_MS:   u64 = 200;
 const COMPRESS_PERIOD_MS: u64 = 500;
-const ANTENNA_PERIOD_MS:  u64 = 1_000;
+const ANTENNA_PERIOD_MS:  u64 = 1_000; //TODO: 1000, can chg
 
 // ── Timing and Safety Thresholds ─────────────────────────────────────────────
-const JITTER_LIMIT_US:    i64   = 1_000;  // warn if jitter exceeds 1ms (Lab 2)
+const JITTER_LIMIT_US:    i64   = 1_000;  // warn if jitter exceeds 1ms (Lab 2) - US = microseconds
 const MAX_CONSEC_MISSES:  u32   = 3;      // safety alert after 3 consecutive drops
 const BUFFER_CAPACITY:    usize = 100;    // max items in the priority buffer
 const DEGRADED_THRESHOLD: f32   = 0.80;  // enter degraded mode at 80% full
 
 // ── Downlink / Radio Parameters ───────────────────────────────────────────────
-const VISIBILITY_INTERVAL_S:  u64 = 10;
+const VISIBILITY_INTERVAL_S:  u64 = 10; // 10 seconds //XXX: new
 const DOWNLINK_WINDOW_MS:     u64 = 30;
 const DOWNLINK_INIT_LIMIT_MS: u64 = 5;
 
 // ── Fault Injection and Simulation ───────────────────────────────────────────
 const FAULT_INTERVAL_S:  u64 = 60;
 const RECOVERY_LIMIT_MS: u64 = 200;
-const SIM_DURATION_S:    u64 = 180;
+const SIM_DURATION_S:    u64 = 180; // XXX: 180 seconds = 3 minutes
 
 // ── Lab 3: Pre-allocated capacities (no runtime realloc during simulation) ────
 // We call Vec::with_capacity() at startup so the Vec never needs to grow
@@ -119,7 +119,7 @@ enum OcsMsg
 {
     Thermal  { student: String, seq: u64, temp: f64,    drift_ms: i64 },
     Accel    { student: String, seq: u64, mag:  f64                    },
-    Gyro     { student: String, gen: u32, seq:  u64, omega_z:    f64   },
+    Gyro     { student: String, generation: u32, seq:  u64, omega_z:    f64   },
     Status   { student: String, iter: u64, fill: f64, state: String, drift_ms: i64 },
     Downlink { student: String, pkt: u64, bytes: usize, q_lat_ms: u64  },
 
@@ -927,7 +927,7 @@ fn fragile_gyroscope(
             let msg = encode(&OcsMsg::Gyro
             {
                 student: STUDENT_ID.into(),
-                gen:     generation,
+                generation:     generation,
                 seq,
                 omega_z,
             });
