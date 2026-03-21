@@ -60,9 +60,9 @@ use serde_json;                         // JSON encode/decode for UDP payloads
 // =============================================================================
 
 // ── Sensor Sampling Periods (milliseconds) ────────────────────────────────────
-const GYRO_PERIOD_MS:    u64 = 20;    // highest priority sensor, fastest rate
-const ACCEL_PERIOD_MS:   u64 = 50; // FIXME: Accelerometer 
-const THERMAL_PERIOD_MS: u64 = 100;
+const THERMAL_PERIOD_MS:    u64 = 50;    // highest priority sensor, fastest rate
+const ACCEL_PERIOD_MS:   u64 = 120; // FIXME: Accelerometer 
+const GYRO_PERIOD_MS: u64 = 333;
 
 // ── Background Task Periods (milliseconds) ────────────────────────────────────
 const HEALTH_PERIOD_MS:   u64 = 200;
