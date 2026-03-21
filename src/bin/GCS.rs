@@ -16,8 +16,8 @@
 //    GCS sends commands to OCS at       127.0.0.1:9001
 //
 //  SERDE / SERDE_JSON:
-//  Incoming OCS payloads are deserialised with serde_json::from_str::<OcsMsg>().
-//  Outgoing GCS commands are serialised with serde_json::to_string(&GcsCmd{}).
+//  Incoming OCS payloads are deserialised with serde_json::from_str::<OcsMessage>().
+//  Outgoing GCS commands are serialised with serde_json::to_string(&GcsCommand{}).
 //  Both types share the same wire format with OCS.
 //
 //  LAB REFERENCE MAP:
@@ -37,10 +37,12 @@
 // =============================================================================
 
 // ── Standard Library Imports ─────────────────────────────────────────────────
+use std::fs::{File, OpenOptions};           // for runtime log file
+use std::io::Write;                         // for writing log lines
 use std::marker::PhantomData;               // for typestate pattern (Lab 7)
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};               // for shared ownership across tasks (Lab 2)
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};         // Instant only — simulation-relative time used throughout
 
 // ── Tokio Async Imports ───────────────────────────────────────────────────────
 use tokio::net::UdpSocket;                  // async UDP socket (Lab 9)
@@ -62,101 +64,152 @@ use serde_json;                             // JSON encode/decode for UDP payloa
 // =============================================================================
 
 // ── Rate Monotonic Command Periods (milliseconds) ─────────────────────────────
-// Shorter period = higher RM priority (Lab 11 concept)
-const THERMAL_CMD_PERIOD_MS:  u64 = 50;    // RM P1 — fastest, highest priority
-const VELOCITY_CMD_PERIOD_MS: u64 = 120;   // RM P2
-const ATTITUDE_CMD_PERIOD_MS: u64 = 333;   // RM P3 — slowest, lowest priority
+// Shorter period = higher RM priority (Week 9 — Rate Monotonic Scheduling)
+const THERMAL_COMMAND_PERIOD:       u64 = 50;   // RM P1 — fastest, highest priority
+const ACCELEROMETER_COMMAND_PERIOD: u64 = 120;  // RM P2
+const GYROSCOPE_COMMAND_PERIOD:     u64 = 333;  // RM P3 — slowest, lowest priority
 
-// ── Timing Deadlines ─────────────────────────────────────────────────────────
-const DECODE_DEADLINE_MS:      u64 = 3;    // soft deadline: parse must complete within 3ms
-const DISPATCH_DEADLINE_MS:    u64 = 2;    // soft deadline: command must be sent within 2ms
-const FAULT_RESPONSE_LIMIT_MS: u64 = 100;  // interlock must engage within 100ms
-const LOC_MISS_THRESHOLD:      u32 = 3;    // loss-of-contact after 3 watchdog misses
-const UPLINK_JITTER_LIMIT_US:  i64 = 2_000;  // warn if uplink jitter > 2ms // TODO: 
-const TELEM_WATCHDOG_MS:       u64 = 800;  // how long without telemetry before incrementing misses // TODO: 
-const REREQUEST_INTERVAL_MS:   u64 = 500;  // how often the LoC monitor checks // TODO: 
+// ── Timing Deadlines (milliseconds) ──────────────────────────────────────────
+const DECODE_DEADLINE:      u64 = 3;    // assignment spec: telemetry must decode within 3ms
+const DISPATCH_DEADLINE:    u64 = 2;    // assignment spec: urgent commands must dispatch within 2ms
+const FAULT_RESPONSE_LIMIT: u64 = 100;  // assignment spec: interlock must engage within 100ms
+
+// ── Loss of Contact and Watchdog ──────────────────────────────────────────────
+const LOSS_OF_CONTACT_MISS_THRESHOLD: u32 = 3;
+// assignment spec: simulate loss of contact after 3 consecutive missed packets
+
+const TELEMETRY_WATCHDOG: u64 = 800;
+// 800ms = 8x the OCS thermal period (100ms).
+// If no packet arrives within 8 cycles, that sensor channel is considered silent.
+
+const REREQUEST_INTERVAL: u64 = 500;
+// Check every 500ms — fast enough to detect silence, slow enough to not flood the system.
+
+// ── Jitter Warning Threshold (microseconds) ───────────────────────────────────
+const UPLINK_JITTER_LIMIT: i64 = 2000;
+// 2000 microseconds = 2ms. Matches the 2ms dispatch deadline (Week 9 — RMS).
 
 // ── Simulation Config ─────────────────────────────────────────────────────────
-const SIM_DURATION_S: u64 = 180;
+const SIMULATION_DURATION: u64 = 180;  // 3 minutes — matches OCS simulation duration
 
 // ── Network Addresses ─────────────────────────────────────────────────────────
-const GCS_TELEM_BIND: &str = "0.0.0.0:9000";
-const OCS_CMD_ADDR:   &str = "127.0.0.1:9001";
-const STUDENT_ID:     &str = "tp071542";
+const GCS_TELEMETRY_BIND:  &str = "0.0.0.0:9000";   // GCS listens for OCS telemetry here
+const OCS_COMMAND_ADDRESS: &str = "127.0.0.1:9001";  // GCS sends commands to OCS here
+
+
+// ── Runtime Log File ──────────────────────────────────────────────────────────
+const RUNTIME_LOG_FILE: &str = "gcs_runtime.log";
+// Detailed per-packet events go here — keeps the terminal readable
 
 
 // =============================================================================
 //  SERDE MESSAGE TYPES  (shared wire format with OCS)
 //
-//  OcsMsg mirrors the enum in OCS.rs exactly.
-//  serde_json::from_str::<OcsMsg>(&payload) replaces the old error-prone:
+//  OcsMessage mirrors the enum in OCS.rs exactly — field names, variant names,
+//  and the #[serde(tag = "tag")] discriminator all match the wire format.
+//  serde_json::from_str::<OcsMessage>(&payload) replaces the old error-prone:
 //    if payload.contains("\"tag\":\"alert\"") { ... }
 //
-//  GcsCmd is serialised with serde_json::to_string(&GcsCmd{...}) and
+//  GcsCommand is serialised with serde_json::to_string(&GcsCommand{...}) and
 //  replaces every manual format!("{{\"tag\":\"cmd\",...}}") string.
 // =============================================================================
 
 // Incoming telemetry messages from the OCS — enum with one variant per message type
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "tag", rename_all = "snake_case")]
-enum OcsMsg
+enum OcsMessage
 {
-    Thermal  { student: String, seq: u64, temp: f64,    drift_ms: i64 },
-    Accel    { student: String, seq: u64, mag:  f64                    },
-    Gyro     { student: String, generation: u32, seq:  u64, omega_z:    f64   },
-    Status   { student: String, iter: u64, fill: f64, state: String, drift_ms: i64 },
-    Downlink { student: String, pkt: u64, bytes: usize, q_lat_ms: u64  },
+    Thermal
+    {
+        seq:      u64,
+        temp:     f64,
+        drift_timing: i64,
+    },
 
-    // Alert uses #[serde(flatten)] so AlertInfo fields merge directly into
-    // the JSON object (same as OCS.rs)
-    Alert    { student: String, event: String, #[serde(flatten)] info: AlertInfo },
+    Accel
+    {
+        seq: u64,
+        mag: f64,
+    },
+
+    Gyro
+    {
+        generation: u32,
+        seq:        u64,
+        omega_z:    f64,
+    },
+
+    Status
+    {
+        iter:     u64,
+        fill:     f64,
+        state:    String,
+        drift_timing: i64,
+    },
+
+    Downlink
+    {
+        pkt:      u64,
+        bytes:    usize,
+        queue_latency: u64,
+    },
+
+    // Alert uses #[serde(flatten)] so AlertInfo fields appear directly
+    // in the JSON object alongside "event", rather than nested.
+    Alert
+    {
+        event: String,
+        #[serde(flatten)]
+        info:  AlertInfo,
+    },
 }
 
-// Optional extra fields inside an Alert (same as OCS.rs)
+// Optional extra fields for Alert messages.
+// We use Option<T> so absent fields are omitted (skip_serializing_if) rather
+// than written as null — keeps the wire format clean.
 #[derive(Serialize, Deserialize, Debug, Default)]
 struct AlertInfo
 {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub misses:     Option<u32>,
+    pub misses:     Option<u32>,      // for thermal miss alerts
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub generation: Option<u32>,
+    pub generation: Option<u32>,      // for gyro restart alerts
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub count:      Option<u32>,
+    pub count:      Option<u32>,      // fault occurrence count
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub fault_type: Option<String>,
+    pub fault_type: Option<String>,   // e.g. "SensorBusHang", "PowerSpike"
 }
 
 // Outgoing command sent to OCS over UDP
 // Optional fields are omitted from JSON when None (cleaner wire format)
 #[derive(Serialize, Deserialize, Debug)]
-struct GcsCmd
+struct GcsCommand
 {
     pub tag:     String,   // always "cmd"
-    pub student: String,
     pub cmd:     String,   // e.g. "ThermalCheck", "EmergencyHalt"
-    pub ts:      u64,      // Unix timestamp in ms
+    pub ts:      u64,      // simulation-relative timestamp in ms
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub priority: Option<u8>,   // RM priority of the issuing task
+    pub priority:   Option<u8>,    // RM priority of the issuing task
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub iter:     Option<u64>,  // which iteration of the task sent this
+    pub iter:       Option<u64>,   // which iteration of the task sent this
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub generation:      Option<u32>,  // which generation of the attitude dispatcher
+    pub generation: Option<u32>,   // which generation of the gyroscope dispatcher
 }
 
-// Helper: serialise a GcsCmd to a JSON string.
+// Helper: serialise a GcsCommand to a JSON string.
 // Logs on error and returns "" so the caller can safely send an empty string.
-fn encode_cmd(cmd: &GcsCmd) -> String
+fn encode_command(command: &GcsCommand) -> String
 {
-    serde_json::to_string(cmd)
-        .unwrap_or_else(|e|
+    serde_json::to_string(command)
+        .unwrap_or_else(|error|
         {
-            println!("[ENCODE] {e}");
+            println!("[ENCODE] {error}");
             String::new()
         })
 }
@@ -286,35 +339,35 @@ struct GcsMetrics
     missed_packets:       u64,
 
     // Lab 3: decode and dispatch latency measurement
-    decode_latency_us:    Vec<u64>,
-    reception_drift_ms:   Vec<i64>,
+    decode_latency:    Vec<u64>,
+    reception_drift_timing:   Vec<i64>,
 
     // Command uplink
     commands_sent:        u64,
     commands_rejected:    u64,
-    dispatch_latency_us:  Vec<u64>,
+    dispatch_latency:  Vec<u64>,
     rejection_log:        Vec<String>,
 
     // Timing violations
     deadline_violations:  Vec<String>,
 
     // Lab 2 / Lab 11: jitter per RM task
-    thermal_jitter_us:    Vec<i64>,
-    velocity_jitter_us:   Vec<i64>,
-    attitude_jitter_us:   Vec<i64>,
+    thermal_jitter:      Vec<i64>,
+    accelerometer_jitter: Vec<i64>, // variable name changed
+    gyroscope_jitter:     Vec<i64>, // variable name changed
 
     // Fault handling
     faults_received:      u64,
-    interlock_latency_ms: Vec<u64>,
+    interlock_latency: Vec<u64>,
     critical_alerts:      Vec<String>,
 
     // CPU estimate
-    drift_ms:    Vec<i64>,
+    drift_timing:    Vec<i64>,
     active_ms:   u64,
-    elapsed_ms:  u64,
+    elapsed_time:  u64,
 
-    // Lab 8: how many times attitude supervisor restarted
-    attitude_restarts: u32,
+    // Lab 8: how many times gyroscope supervisor restarted
+    gyroscope_restarts: u32, // variable name changed
 
     // Component 4 — backlog depth   (lab 2 — Arc<Mutex<T>> shared counter)
     // Tracks how many packets are sitting in the incoming channel unprocessed
@@ -330,14 +383,14 @@ struct GcsState
     fault_log:          Vec<String>,
 
     // Lab 7: consecutive miss counters (same pattern as Lab 7's glitch_count)
-    thermal_misses:     u32,
-    velocity_misses:    u32,
-    attitude_misses:    u32,
+    thermal_misses:       u32,
+    accelerometer_misses: u32, // variable name changed
+    gyroscope_misses:     u32, // variable name changed
 
     // Watchdog timestamps — updated on each successful telemetry receipt
-    last_thermal_ms:    u64,
-    last_velocity_ms:   u64,
-    last_attitude_ms:   u64,
+    last_thermal:       u64,
+    last_accelerometer: u64, // variable name changed
+    last_gyroscope:     u64, // variable name changed
 
     loss_of_contact:    bool,
 }
@@ -347,19 +400,18 @@ impl Default for GcsState
 {
     fn default() -> Self
     {
-        let t = now_ms();
         GcsState
         {
-            fault_active:      false,
-            fault_detected_at: None,
-            fault_log:         Vec::new(),
-            thermal_misses:    0,
-            velocity_misses:   0,
-            attitude_misses:   0,
-            last_thermal_ms:   t,
-            last_velocity_ms:  t,
-            last_attitude_ms:  t,
-            loss_of_contact:   false,
+            fault_active:          false,
+            fault_detected_at:     None,
+            fault_log:             Vec::new(),
+            thermal_misses:        0,
+            accelerometer_misses:  0, // variable name changed
+            gyroscope_misses:      0, // variable name changed
+            last_thermal:          0,
+            last_accelerometer:    0, // variable name changed
+            last_gyroscope:        0, // variable name changed
+            loss_of_contact:       false,
         }
     }
 }
@@ -369,13 +421,32 @@ impl Default for GcsState
 //  HELPER FUNCTIONS
 // =============================================================================
 
-// Returns current Unix time in milliseconds
-fn now_ms() -> u64
+// Shared Arc<Mutex<T>> alias to reduce signature noise (matches OCS style)
+type Shared<T> = Arc<Mutex<T>>;
+
+// Returns simulation-relative time in milliseconds from simulation start.
+// This replaces Unix time (SystemTime::now()) throughout the GCS.
+// Every log line and timestamp is relative to when the simulation began,
+// making it directly comparable to OCS log output.
+fn simulation_elapsed(simulation_start: &Instant) -> u64
 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
+    simulation_start.elapsed().as_millis() as u64
+}
+
+// Helper: write a detailed runtime log line to the log file only.
+// Used for high-frequency per-packet events that would flood the terminal.
+fn write_runtime_log(runtime_logger: &Shared<File>, line: &str)
+{
+    let mut log_file = runtime_logger.lock().unwrap();
+    let _ = writeln!(log_file, "{line}");
+}
+
+// Helper: print important events to terminal AND write them to the runtime log.
+// Used for faults, alerts, deadline violations — events worth seeing live.
+fn print_and_log(runtime_logger: &Shared<File>, line: &str)
+{
+    println!("{line}");
+    write_runtime_log(runtime_logger, line);
 }
 
 // Pretty-print one row of the metrics table (Lab 3: min/max/avg statistics)
@@ -387,13 +458,17 @@ fn print_stat_row(label: &str, samples: &[i64])
         return;
     }
 
-    let min = samples.iter().min().unwrap();
-    let max = samples.iter().max().unwrap();
-    let avg = samples.iter().sum::<i64>() as f64 / samples.len() as f64;
+    let minimum_value = samples.iter().min().unwrap();
+    let maximum_value = samples.iter().max().unwrap();
+    let average_value = samples.iter().sum::<i64>() as f64 / samples.len() as f64;
 
     println!(
         "    {:<36} n={:>5}  min={:>7}  max={:>7}  avg={:>9.1}",
-        label, samples.len(), min, max, avg
+        label,
+        samples.len(),
+        minimum_value,
+        maximum_value,
+        average_value
     );
 }
 
@@ -414,6 +489,27 @@ fn classify_event(event: &str) -> OcsFaultKind
 
 
 // =============================================================================
+//  LOG FILE INITIALISER
+//
+//  Creates/truncates the runtime log file at startup.
+//  Detailed per-packet events are written here to keep the terminal readable.
+//  Matches the OCS create_runtime_logger() pattern.
+// =============================================================================
+
+fn create_runtime_logger() -> Shared<File>
+{
+    let log_file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(RUNTIME_LOG_FILE)
+        .expect("[LOG] Failed to create runtime log file");
+
+    Arc::new(Mutex::new(log_file))
+}
+
+
+// =============================================================================
 //  UDP RECEIVER LOOP   (Lab 9: tokio::net::UdpSocket async recv_from)
 //
 //  Continuously receives UDP packets from the OCS and forwards them
@@ -425,15 +521,23 @@ fn classify_event(event: &str) -> OcsFaultKind
 // =============================================================================
 
 async fn udp_receiver_loop(
-    sock:        Arc<UdpSocket>,
-    incoming_tx: mpsc::Sender<IncomingPacket>,  // Lab 11: producer side of channel
-    backlog_counter: Arc<Mutex<usize>>,           // NEW (lab 2)
-    shutdown:    CancellationToken,              // Lab 8: cancellation signal
+    sock:             Arc<UdpSocket>,
+    incoming_tx:      mpsc::Sender<IncomingPacket>,  // Lab 11: producer side of channel
+    backlog_counter:  Shared<usize>,
+    runtime_logger:   Shared<File>,
+    simulation_start: Instant,
+    shutdown:         CancellationToken,             // Lab 8: cancellation signal
 )
 {
-    println!("[UDP-RX]   Listening for OCS telemetry on {GCS_TELEM_BIND}");
+    print_and_log(
+        &runtime_logger,
+        &format!(
+            "[{}ms] [UDP Receiver] Listening for OCS telemetry on {GCS_TELEMETRY_BIND}",
+            simulation_elapsed(&simulation_start)
+        ),
+    );
 
-    let mut buf = vec![0u8; 65535];
+    let mut buf = vec![0u8; 4096];  // 4096 bytes is plenty for a JSON telemetry packet
 
     loop
     {
@@ -443,7 +547,10 @@ async fn udp_receiver_loop(
             // Branch 1: shutdown was requested
             _ = shutdown.cancelled() =>
             {
-                println!("[UDP-RX]   Exit.");
+                print_and_log(
+                    &runtime_logger,
+                    &format!("[{}ms] [UDP Receiver] Exit.", simulation_elapsed(&simulation_start)),
+                );
                 return;
             }
 
@@ -458,11 +565,7 @@ async fn udp_receiver_loop(
                         let received_at = Instant::now();
                         let payload = String::from_utf8_lossy(&buf[..len]).to_string();
 
-                        // // Lab 11: send to telemetry processor via channel
-                        // if incoming_tx.try_send(IncomingPacket { payload, received_at, from }).is_err()
-                        // {
-                        //     println!("[UDP-RX]   Channel full — packet dropped");
-                        // }
+                        // Lab 11: send to telemetry processor via channel
                         if incoming_tx.try_send(IncomingPacket { payload, received_at, from }).is_ok()
                         {
                             // lab 2 — increment backlog counter on successful send
@@ -470,10 +573,22 @@ async fn udp_receiver_loop(
                         }
                         else
                         {
-                            println!("[UDP-RX]   Channel full — packet dropped");
+                            print_and_log(
+                                &runtime_logger,
+                                &format!(
+                                    "[{}ms] [UDP Receiver] Channel full — packet dropped from {from}",
+                                    simulation_elapsed(&simulation_start)
+                                ),
+                            );
                         }
                     }
-                    Err(e) => println!("[UDP-RX]   recv_from: {e}"),
+                    Err(error) => print_and_log(
+                        &runtime_logger,
+                        &format!(
+                            "[{}ms] [UDP Receiver] recv_from error: {error}",
+                            simulation_elapsed(&simulation_start)
+                        ),
+                    ),
                 }
             }
         }
@@ -491,13 +606,21 @@ async fn udp_receiver_loop(
 // =============================================================================
 
 async fn udp_sender_task(
-    mut rx:   mpsc::Receiver<UplinkCmd>,
-    sock:     Arc<UdpSocket>,
-    metrics:  Arc<Mutex<GcsMetrics>>,
-    shutdown: CancellationToken,
+    mut rx:           mpsc::Receiver<UplinkCmd>,
+    sock:             Arc<UdpSocket>,
+    metrics:          Shared<GcsMetrics>,
+    runtime_logger:   Shared<File>,
+    simulation_start: Instant,
+    shutdown:         CancellationToken,
 )
 {
-    println!("[UDP-TX]   Command sender → {OCS_CMD_ADDR}");
+    print_and_log(
+        &runtime_logger,
+        &format!(
+            "[{}ms] [UDP Sender] Command link established → {OCS_COMMAND_ADDRESS}",
+            simulation_elapsed(&simulation_start)
+        ),
+    );
 
     loop
     {
@@ -506,7 +629,10 @@ async fn udp_sender_task(
         {
             _ = shutdown.cancelled() =>
             {
-                println!("[UDP-TX]   Exit.");
+                print_and_log(
+                    &runtime_logger,
+                    &format!("[{}ms] [UDP Sender] Exit.", simulation_elapsed(&simulation_start)),
+                );
                 return;
             }
 
@@ -517,28 +643,49 @@ async fn udp_sender_task(
                     Some(c) =>
                     {
                         // Lab 3: measure how long the command sat in the queue
-                        let dispatch_us = c.created_at.elapsed().as_micros() as u64;
+                        // .as_micros() used here — dispatch latency is a short duration
+                        // where microsecond precision matters
+                        let dispatch = c.created_at.elapsed().as_micros() as u64;
 
-                        match sock.send_to(c.payload.as_bytes(), OCS_CMD_ADDR).await
+                        match sock.send_to(c.payload.as_bytes(), OCS_COMMAND_ADDRESS).await
                         {
                             Ok(_) =>
                             {
                                 // Check dispatch deadline
-                                if dispatch_us / 1_000 > DISPATCH_DEADLINE_MS
+                                if dispatch / 1000 > DISPATCH_DEADLINE
                                 {
-                                    let v = format!(
+                                    let violation = format!(
                                         "[{}ms] [DEADLINE] Dispatch {}µs > {}ms",
-                                        now_ms(), dispatch_us, DISPATCH_DEADLINE_MS
+                                        simulation_elapsed(&simulation_start),
+                                        dispatch,
+                                        DISPATCH_DEADLINE
                                     );
-                                    println!("{v}");
-                                    metrics.lock().unwrap().deadline_violations.push(v);
+                                    print_and_log(&runtime_logger, &violation);
+                                    metrics.lock().unwrap().deadline_violations.push(violation);
+                                }
+                                else
+                                {
+                                    write_runtime_log(
+                                        &runtime_logger,
+                                        &format!(
+                                            "[{}ms] [UDP Sender] Sent: {}",
+                                            simulation_elapsed(&simulation_start),
+                                            c.payload
+                                        ),
+                                    );
                                 }
 
                                 let mut m = metrics.lock().unwrap();
                                 m.commands_sent += 1;
-                                m.dispatch_latency_us.push(dispatch_us);
+                                m.dispatch_latency.push(dispatch);
                             }
-                            Err(e) => println!("[UDP-TX]   send_to: {e}"),
+                            Err(error) => print_and_log(
+                                &runtime_logger,
+                                &format!(
+                                    "[{}ms] [UDP Sender] send_to error: {error}",
+                                    simulation_elapsed(&simulation_start)
+                                ),
+                            ),
                         }
                     }
                     None => return,  // channel closed — all senders dropped
@@ -553,7 +700,7 @@ async fn udp_sender_task(
 //  PART 1 — TELEMETRY PROCESSOR  (Lab 6: spawn_blocking + serde deserialise)
 //
 //  Receives raw UDP packets from the udp_receiver_loop via mpsc channel
-//  and decodes them into typed OcsMsg values using serde_json.
+//  and decodes them into typed OcsMessage values using serde_json.
 //
 //  KEY LESSON from Lab 6:
 //  JSON parsing is CPU-bound synchronous work. Running it inline would
@@ -566,27 +713,34 @@ async fn udp_sender_task(
 // =============================================================================
 
 // Synchronous decode function — runs inside spawn_blocking (Lab 6).
-// serde_json::from_str parses the raw bytes into a typed OcsMsg.
-fn decode_packet_sync(payload: String) -> Result<OcsMsg, String>
+// serde_json::from_str parses the raw bytes into a typed OcsMessage.
+fn decode_packet_sync(payload: String) -> Result<OcsMessage, String>
 {
-    serde_json::from_str::<OcsMsg>(&payload)
-        .map_err(|e| format!("serde parse error: {e}  payload={payload}"))
+    serde_json::from_str::<OcsMessage>(&payload)
+        .map_err(|error| format!("serde parse error: {error}  payload={payload}"))
 }
 
 async fn telemetry_processor_task(
-    mut rx:   mpsc::Receiver<IncomingPacket>,   // Lab 11: consumer
-    state:    Arc<Mutex<GcsState>>,
-    metrics:  Arc<Mutex<GcsMetrics>>,
-    cmd_tx:   mpsc::Sender<UplinkCmd>,
-    backlog_counter: Arc<Mutex<usize>>,           // NEW (lab 2)
-    shutdown: CancellationToken,
+    mut rx:           mpsc::Receiver<IncomingPacket>,   // Lab 11: consumer
+    state:            Shared<GcsState>,
+    metrics:          Shared<GcsMetrics>,
+    cmd_tx:           mpsc::Sender<UplinkCmd>,
+    backlog_counter:  Shared<usize>,
+    runtime_logger:   Shared<File>,
+    simulation_start: Instant,
+    shutdown:         CancellationToken,
 )
 {
-    println!(
-        "[TelRx]    Processor ready.  decode_deadline={}ms  (spawn_blocking + serde)",
-        DECODE_DEADLINE_MS
+    print_and_log(
+        &runtime_logger,
+        &format!(
+            "[{}ms] [Telemetry Receiver] Ready.  decode_deadline={}ms  (spawn_blocking + serde_json)",
+            simulation_elapsed(&simulation_start),
+            DECODE_DEADLINE
+        ),
     );
 
+    // Tracks the Instant of the last received packet for reception drift
     let mut last_any_rx: Option<Instant> = None;
 
     loop
@@ -596,7 +750,10 @@ async fn telemetry_processor_task(
         {
             _ = shutdown.cancelled() =>
             {
-                println!("[TelRx]    Exit.");
+                print_and_log(
+                    &runtime_logger,
+                    &format!("[{}ms] [Telemetry Receiver] Exit.", simulation_elapsed(&simulation_start)),
+                );
                 return;
             }
 
@@ -626,152 +783,166 @@ async fn telemetry_processor_task(
                             move || decode_packet_sync(payload)
                         ).await;
 
-                        // Lab 3: measure decode latency from the moment the packet arrived
-                        let decode_us = arrival.elapsed().as_micros() as u64;
-                        let decode_ms = decode_us / 1_000;
+                        // Lab 3: measure decode latency using .as_micros() for precision
+                        // This is one of the cases where microseconds are appropriate —
+                        // decode latency is short enough that ms would lose resolution.
+                        let decode_time = arrival.elapsed().as_micros() as u64;
+                        let decode_time_ms = decode_time / 1000;
 
-                        if decode_ms > DECODE_DEADLINE_MS
+                        if decode_time_ms > DECODE_DEADLINE
                         {
-                            let v = format!(
+                            let violation = format!(
                                 "[{}ms] [DEADLINE] Decode {}ms > {}ms  from={from}",
-                                now_ms(), decode_ms, DECODE_DEADLINE_MS
+                                simulation_elapsed(&simulation_start),
+                                decode_time_ms,
+                                DECODE_DEADLINE
                             );
-                            println!("{v}");
-                            metrics.lock().unwrap().deadline_violations.push(v);
+                            print_and_log(&runtime_logger, &violation);
+                            metrics.lock().unwrap().deadline_violations.push(violation);
                         }
 
                         // Unwrap the JoinHandle result first, then the parse result
                         let msg = match decode_result
                         {
-                            Err(_)       =>
+                            Err(_)            =>
                             {
-                                println!("[TelRx]    spawn_blocking panic");
+                                write_runtime_log(&runtime_logger, "[Telemetry Receiver] spawn_blocking panic");
                                 continue;
                             }
                             Ok(Err(why)) =>
                             {
-                                println!("[TelRx]    Parse fail: {why}");
+                                write_runtime_log(
+                                    &runtime_logger,
+                                    &format!("[Telemetry Receiver] Parse fail: {why}"),
+                                );
                                 continue;
                             }
-                            Ok(Ok(m))    => m,
+                            Ok(Ok(m)) => m,
                         };
 
-                        // Reception drift (Lab 2: jitter formula)
-                        let drift_ms: i64 = if let Some(prev) = last_any_rx //TODO ???? FORMULA WRONG?
+                        // lab 2 — reception drift: actual gap between consecutive packets.
+                        // Mixed-sensor stream (thermal 100ms, accel 50ms, gyro 20ms) means
+                        // no single expected period applies — we log the raw inter-packet gap.
+                        let drift_timing: i64 = if let Some(prev) = last_any_rx
                         {
                             prev.elapsed().as_millis() as i64
-                                - THERMAL_CMD_PERIOD_MS as i64 * 10
                         }
-                        else
-                        {
-                            0
-                        };
+                        else { 0 };
                         last_any_rx = Some(Instant::now());
 
-
-
-//                         // lab 2 — drift: actual gap since last packet (no fixed expected period needed)
-// let drift_ms: i64 = if let Some(prev) = last_any_rx
-// {
-//     prev.elapsed().as_millis() as i64  // just the actual gap — log it raw
-// }
-// else { 0 };
-// last_any_rx = Some(Instant::now());
-// ```
-
-// ### Problem 5 — the `OcsMsg` enum variants don't match the OCS
-
-// The OCS publishes MQTT payloads as JSON strings like:
-// ```
-// {"seq":5,"value":22.5,"ts":1234567890,"sensor":"thermal","priority":1}
-
-
-
-
-                        // ── serde: match on typed OcsMsg variants ────────────────────────
-                        // Before serde, this was: if payload.contains("\"tag\":\"alert\"") { ... }
+                        // ── serde: match on typed OcsMessage variants ─────────────────────
+                        // Before serde this was: if payload.contains("\"tag\":\"alert\"") { ... }
                         // Now the compiler verifies every field exists and has the right type.
                         match &msg
                         {
-                            OcsMsg::Alert { event, .. } =>
+                            OcsMessage::Alert { event, .. } =>
                             {
-                                // Delegate to the fault handler
-                                handle_ocs_alert(&msg, &state, &metrics, &cmd_tx);
+                                handle_ocs_alert(
+                                    &msg,
+                                    &state,
+                                    &metrics,
+                                    &cmd_tx,
+                                    &runtime_logger,
+                                    &simulation_start,
+                                );
                                 continue;
                             }
 
-                            OcsMsg::Thermal { seq, temp, drift_ms: sensor_drift, .. } =>
+                            OcsMessage::Thermal { seq, temp, drift_timing: sensor_drift } =>
                             {
-                                println!(
-                                    "[TelRx]    thermal  seq={seq}  temp={temp:.2}°C  \
-                                     sensor_drift={sensor_drift:+}ms  decode={decode_us}µs"
+                                write_runtime_log(
+                                    &runtime_logger,
+                                    &format!(
+                                        "[{}ms] [Telemetry Receiver] thermal  seq={seq}  \
+                                         temp={temp:.2}°C  sensor_drift={sensor_drift:+}ms  decode={decode_time}µs",
+                                        simulation_elapsed(&simulation_start)
+                                    ),
                                 );
 
                                 // Lab 7: reset consecutive miss counter on success
                                 let mut s = state.lock().unwrap();
-                                s.thermal_misses  = 0;
-                                s.last_thermal_ms = now_ms();
+                                s.thermal_misses = 0;
+                                s.last_thermal   = simulation_elapsed(&simulation_start);
 
                                 if s.loss_of_contact
                                 {
                                     s.loss_of_contact = false;
-                                    println!("[TelRx] Contact restored.");
+                                    print_and_log(&runtime_logger, &format!(
+                                        "[{}ms] [Telemetry Receiver] Thermal contact restored.",
+                                        simulation_elapsed(&simulation_start)
+                                    ));
                                 }
                             }
 
-                            OcsMsg::Status { iter, fill, state: sys_state, .. } =>
+                            OcsMessage::Status { iter, fill, state: sys_state, drift_timing: _ } =>
                             {
-                                println!(
-                                    "[TelRx]    status   iter={iter}  fill={fill:.1}%  \
-                                     state={sys_state}  decode={decode_us}µs"
+                                write_runtime_log(
+                                    &runtime_logger,
+                                    &format!(
+                                        "[{}ms] [Telemetry Receiver] status   iter={iter}  \
+                                         fill={fill:.1}%  state={sys_state}  decode={decode_time}µs",
+                                        simulation_elapsed(&simulation_start)
+                                    ),
                                 );
                                 let mut s = state.lock().unwrap();
-                                s.thermal_misses  = 0;
-                                s.last_thermal_ms = now_ms();
+                                s.thermal_misses = 0;
+                                s.last_thermal   = simulation_elapsed(&simulation_start);
                                 if s.loss_of_contact { s.loss_of_contact = false; }
                             }
 
-                            OcsMsg::Accel { seq, mag, .. } =>
+                            OcsMessage::Accel { seq, mag } =>
                             {
-                                println!(
-                                    "[TelRx]    accel    seq={seq}  mag={mag:.4}  \
-                                     decode={decode_us}µs"
+                                write_runtime_log(
+                                    &runtime_logger,
+                                    &format!(
+                                        "[{}ms] [Telemetry Receiver] accel    seq={seq}  \
+                                         mag={mag:.4}  decode={decode_time}µs",
+                                        simulation_elapsed(&simulation_start)
+                                    ),
                                 );
                                 let mut s = state.lock().unwrap();
-                                s.velocity_misses  = 0;
-                                s.last_velocity_ms = now_ms();
+                                s.accelerometer_misses  = 0; // variable name changed
+                                s.last_accelerometer    = simulation_elapsed(&simulation_start); // variable name changed
                                 if s.loss_of_contact { s.loss_of_contact = false; }
                             }
 
-                            OcsMsg::Gyro { generation, seq, omega_z, .. } =>
+                            OcsMessage::Gyro { generation, seq, omega_z } =>
                             {
-                                println!(
-                                    "[TelRx]    gyro     gen={generation}  seq={seq}  \
-                                     ω_z={omega_z:.4}  decode={decode_us}µs"
+                                write_runtime_log(
+                                    &runtime_logger,
+                                    &format!(
+                                        "[{}ms] [Telemetry Receiver] gyro     gen={generation}  \
+                                         seq={seq}  ω_z={omega_z:.4}  decode={decode_time}µs",
+                                        simulation_elapsed(&simulation_start)
+                                    ),
                                 );
                                 let mut s = state.lock().unwrap();
-                                s.attitude_misses  = 0;
-                                s.last_attitude_ms = now_ms();
+                                s.gyroscope_misses  = 0; // variable name changed
+                                s.last_gyroscope    = simulation_elapsed(&simulation_start); // variable name changed
                                 if s.loss_of_contact { s.loss_of_contact = false; }
                             }
 
-                            OcsMsg::Downlink { pkt, bytes, q_lat_ms, .. } =>
+                            OcsMessage::Downlink { pkt, bytes, queue_latency } =>
                             {
-                                println!(
-                                    "[TelRx]    downlink pkt={pkt}  {bytes}B  \
-                                     q_lat={q_lat_ms}ms  decode={decode_us}µs"
+                                write_runtime_log(
+                                    &runtime_logger,
+                                    &format!(
+                                        "[{}ms] [Telemetry Receiver] downlink pkt={pkt}  \
+                                         {bytes}B  q_lat={queue_latency}ms  decode={decode_time}µs",
+                                        simulation_elapsed(&simulation_start)
+                                    ),
                                 );
                                 let mut s = state.lock().unwrap();
-                                s.velocity_misses  = 0;
-                                s.last_velocity_ms = now_ms();
+                                s.accelerometer_misses  = 0; // variable name changed
+                                s.last_accelerometer    = simulation_elapsed(&simulation_start); // variable name changed
                                 if s.loss_of_contact { s.loss_of_contact = false; }
                             }
                         }
 
                         let mut m = metrics.lock().unwrap();
                         m.telemetry_received += 1;
-                        m.decode_latency_us.push(decode_us);
-                        m.reception_drift_ms.push(drift_ms);
+                        m.decode_latency.push(decode_time);
+                        m.reception_drift_timing.push(drift_timing);
                     }
                 }
             }
@@ -780,33 +951,36 @@ async fn telemetry_processor_task(
 }
 
 // Handle an incoming OCS Alert message.
-// Takes the typed OcsMsg (already validated by serde) instead of a raw &str.
+// Takes the typed OcsMessage (already validated by serde) instead of a raw &str.
 // Lab 7: classify the event string, then match on the typed enum variant.
 fn handle_ocs_alert(
-    msg:     &OcsMsg,
-    state:   &Arc<Mutex<GcsState>>,
-    metrics: &Arc<Mutex<GcsMetrics>>,
-    cmd_tx:  &mpsc::Sender<UplinkCmd>,
+    msg:              &OcsMessage,
+    state:            &Shared<GcsState>,
+    metrics:          &Shared<GcsMetrics>,
+    cmd_tx:           &mpsc::Sender<UplinkCmd>,
+    runtime_logger:   &Shared<File>,
+    simulation_start: &Instant,
 )
 {
     // Extract the event string from the Alert variant
     let event = match msg
     {
-        OcsMsg::Alert { event, .. } => event.as_str(),
-        _                           => return,  // not an alert — ignore
+        OcsMessage::Alert { event, .. } => event.as_str(),
+        _                               => return,  // not an alert — ignore
     };
 
     // Lab 7: convert event string → typed OcsFaultKind enum
     let kind = classify_event(event);
-    println!("[FaultMgr] OCS alert: {kind:?}  event=\"{event}\"");
 
-    let fault_msg = format!("[{}ms] [OCS-ALERT] {kind:?}", now_ms());
+    let fault_msg = format!(
+        "[{}ms] [OCS-ALERT] {kind:?}  event=\"{event}\"",
+        simulation_elapsed(simulation_start)
+    );
+    print_and_log(runtime_logger, &fault_msg);
 
-    let mut s = state.lock().unwrap();
-    let mut m = metrics.lock().unwrap();
-
-    m.faults_received += 1;
-    s.fault_log.push(fault_msg);
+    // Lock each mutex briefly and release before the next — (lab 2 deadlock prevention)
+    metrics.lock().unwrap().faults_received += 1;
+    state.lock().unwrap().fault_log.push(fault_msg);
 
     // Lab 7: match on enum variant (mirrors the fault_injector match in OCS)
     match kind
@@ -815,27 +989,29 @@ fn handle_ocs_alert(
         {
             let alert = format!(
                 "[{}ms] !!! CRITICAL GROUND ALERT !!! Mission Abort",
-                now_ms()
+                simulation_elapsed(simulation_start)
             );
-            println!("{alert}");
-            m.critical_alerts.push(alert);
+            print_and_log(runtime_logger, &alert);
+            metrics.lock().unwrap().critical_alerts.push(alert);
 
-            if !s.fault_active
             {
-                s.fault_active      = true;
-                s.fault_detected_at = Some(Instant::now());
+                let mut s = state.lock().unwrap();
+                if !s.fault_active
+                {
+                    s.fault_active      = true;
+                    s.fault_detected_at = Some(Instant::now());
+                }
             }
 
             // Emergency halt bypasses typestate — this IS the fault-setter path
-            let payload = encode_cmd(&GcsCmd
+            let payload = encode_command(&GcsCommand
             {
-                tag:      "cmd".into(),
-                student:  STUDENT_ID.into(),
-                cmd:      "EmergencyHalt".into(),
-                ts:       now_ms(),
-                priority: Some(1),
-                iter:     None,
-                generation:      None,
+                tag:        "cmd".into(),
+                cmd:        "EmergencyHalt".into(),
+                ts:         simulation_elapsed(simulation_start),
+                priority:   Some(1),
+                iter:       None,
+                generation: None,
             });
             let _ = cmd_tx.try_send(UplinkCmd
             {
@@ -847,17 +1023,24 @@ fn handle_ocs_alert(
 
         OcsFaultKind::ThermalAlert | OcsFaultKind::FaultInjected | OcsFaultKind::GyroRestart =>
         {
+            let mut s = state.lock().unwrap();
             if !s.fault_active
             {
                 s.fault_active      = true;
                 s.fault_detected_at = Some(Instant::now());
-                println!("[FaultMgr] Safety interlock ENGAGED — commands blocked");
+                print_and_log(runtime_logger, &format!(
+                    "[{}ms] [Fault Manager] Safety interlock ENGAGED — commands blocked",
+                    simulation_elapsed(simulation_start)
+                ));
             }
         }
 
         OcsFaultKind::Unknown =>
         {
-            println!("[FaultMgr] Unknown alert \"{event}\" — logged, interlock not engaged");
+            print_and_log(runtime_logger, &format!(
+                "[{}ms] [Fault Manager] Unknown alert \"{event}\" — logged, interlock not engaged",
+                simulation_elapsed(simulation_start)
+            ));
         }
     }
 }
@@ -871,17 +1054,25 @@ fn handle_ocs_alert(
 //
 //  Lab 7: consecutive miss counters are reset on every received telemetry
 //  message (same pattern as glitch_count reset in Lab 7's run_sensor_loop).
-//  When misses exceed LOC_MISS_THRESHOLD → Loss of Contact.
+//  When misses exceed LOSS_OF_CONTACT_MISS_THRESHOLD → Loss of Contact.
 // =============================================================================
 
 async fn loss_of_contact_monitor_task(
-    state:    Arc<Mutex<GcsState>>,
-    metrics:  Arc<Mutex<GcsMetrics>>,
-    cmd_tx:   mpsc::Sender<UplinkCmd>,
-    shutdown: CancellationToken,
+    state:            Shared<GcsState>,
+    metrics:          Shared<GcsMetrics>,
+    cmd_tx:           mpsc::Sender<UplinkCmd>,
+    runtime_logger:   Shared<File>,
+    simulation_start: Instant,
+    shutdown:         CancellationToken,
 )
 {
-    println!("[LoC]      Monitor  threshold={LOC_MISS_THRESHOLD}");
+    print_and_log(
+        &runtime_logger,
+        &format!(
+            "[{}ms] [Loss of Contact Monitor] Started.  threshold={LOSS_OF_CONTACT_MISS_THRESHOLD}",
+            simulation_elapsed(&simulation_start)
+        ),
+    );
 
     loop
     {
@@ -890,57 +1081,59 @@ async fn loss_of_contact_monitor_task(
         {
             _ = shutdown.cancelled() =>
             {
-                println!("[LoC]      Exit.");
+                print_and_log(
+                    &runtime_logger,
+                    &format!("[{}ms] [Loss of Contact Monitor] Exit.", simulation_elapsed(&simulation_start)),
+                );
                 return;
             }
-            _ = sleep(Duration::from_millis(REREQUEST_INTERVAL_MS)) => {}
+            _ = sleep(Duration::from_millis(REREQUEST_INTERVAL)) => {}
         }
 
-        let ts = now_ms();
+        let ts = simulation_elapsed(&simulation_start);
 
-        // Read current miss counts and timestamps
-        let (th, vel, att, last_th, last_vel, last_att, loc);
+        // Read current miss counts and last-heard timestamps
+        let (th, accel, gyro, last_th, last_accel, last_gyro, loc); // variable name changed
         {
-            let s   = state.lock().unwrap();
-            th      = s.thermal_misses;
-            vel     = s.velocity_misses;
-            att     = s.attitude_misses;
-            last_th = s.last_thermal_ms;
-            last_vel= s.last_velocity_ms;
-            last_att= s.last_attitude_ms;
-            loc     = s.loss_of_contact;
+            let s      = state.lock().unwrap();
+            th         = s.thermal_misses;
+            accel      = s.accelerometer_misses; // variable name changed
+            gyro       = s.gyroscope_misses;     // variable name changed
+            last_th    = s.last_thermal;
+            last_accel = s.last_accelerometer;   // variable name changed
+            last_gyro  = s.last_gyroscope;       // variable name changed
+            loc        = s.loss_of_contact;
         }
 
-        // Increment miss counters for any silent telemetry channel
+        // Increment miss counters for any sensor channel that has been silent
         {
             let mut s = state.lock().unwrap();
-            if ts.saturating_sub(last_th)  > TELEM_WATCHDOG_MS { s.thermal_misses  += 1; }
-            if ts.saturating_sub(last_vel) > TELEM_WATCHDOG_MS { s.velocity_misses += 1; }
-            if ts.saturating_sub(last_att) > TELEM_WATCHDOG_MS { s.attitude_misses += 1; }
+            if ts.saturating_sub(last_th)    > TELEMETRY_WATCHDOG { s.thermal_misses       += 1; }
+            if ts.saturating_sub(last_accel) > TELEMETRY_WATCHDOG { s.accelerometer_misses += 1; } // variable name changed
+            if ts.saturating_sub(last_gyro)  > TELEMETRY_WATCHDOG { s.gyroscope_misses     += 1; } // variable name changed
         }
 
-        let max_m = th.max(vel).max(att);
+        let max_m = th.max(accel).max(gyro); // variable name changed
 
-        if max_m >= LOC_MISS_THRESHOLD && !loc
+        if max_m >= LOSS_OF_CONTACT_MISS_THRESHOLD && !loc
         {
             let alert = format!(
-                "[{ts}ms] !!! LOSS OF CONTACT !!!  th={th} vel={vel} att={att}"
+                "[{ts}ms] !!! LOSS OF CONTACT !!!  thermal={th} accel={accel} gyro={gyro}" // variable name changed
             );
-            println!("{alert}");
+            print_and_log(&runtime_logger, &alert);
             metrics.lock().unwrap().critical_alerts.push(alert);
             state.lock().unwrap().loss_of_contact = true;
             metrics.lock().unwrap().missed_packets += max_m as u64;
 
             // serde: encode a re-request command and send to OCS
-            let payload = encode_cmd(&GcsCmd
+            let payload = encode_command(&GcsCommand
             {
-                tag:      "cmd".into(),
-                student:  STUDENT_ID.into(),
-                cmd:      "RetransmitRequest".into(),
+                tag:        "cmd".into(),
+                cmd:        "RetransmitRequest".into(),
                 ts,
-                priority: Some(1),
-                iter:     None,
-                generation:      None,
+                priority:   Some(1),
+                iter:       None,
+                generation: None,
             });
             let _ = cmd_tx.try_send(UplinkCmd
             {
@@ -949,12 +1142,18 @@ async fn loss_of_contact_monitor_task(
                 created_at: Instant::now(),
             });
 
-            println!("[LoC]      Re-request sent.");
+            print_and_log(
+                &runtime_logger,
+                &format!("[{ts}ms] [Loss of Contact Monitor] Re-request sent to OCS."),
+            );
         }
-        else if loc && max_m < LOC_MISS_THRESHOLD
+        else if loc && max_m < LOSS_OF_CONTACT_MISS_THRESHOLD
         {
             state.lock().unwrap().loss_of_contact = false;
-            println!("[LoC]      Contact restored.");
+            print_and_log(
+                &runtime_logger,
+                &format!("[{ts}ms] [Loss of Contact Monitor] Contact restored."),
+            );
         }
     }
 }
@@ -965,16 +1164,25 @@ async fn loss_of_contact_monitor_task(
 //
 //  Monitors the fault_active flag and measures how long it takes from
 //  fault detection to interlock engagement (Lab 3 latency measurement).
-//  If the interlock takes longer than FAULT_RESPONSE_LIMIT_MS → critical alert.
+//  If the interlock takes longer than FAULT_RESPONSE_LIMIT → critical alert.
 // =============================================================================
 
 async fn fault_manager_task(
-    state:    Arc<Mutex<GcsState>>,
-    metrics:  Arc<Mutex<GcsMetrics>>,
-    shutdown: CancellationToken,
+    state:            Shared<GcsState>,
+    metrics:          Shared<GcsMetrics>,
+    runtime_logger:   Shared<File>,
+    simulation_start: Instant,
+    shutdown:         CancellationToken,
 )
 {
-    println!("[FaultMgr] Manager  response_limit={}ms", FAULT_RESPONSE_LIMIT_MS);
+    print_and_log(
+        &runtime_logger,
+        &format!(
+            "[{}ms] [Fault Manager] Started.  response_limit={}ms",
+            simulation_elapsed(&simulation_start),
+            FAULT_RESPONSE_LIMIT
+        ),
+    );
 
     loop
     {
@@ -983,7 +1191,10 @@ async fn fault_manager_task(
         {
             _ = shutdown.cancelled() =>
             {
-                println!("[FaultMgr] Exit.");
+                print_and_log(
+                    &runtime_logger,
+                    &format!("[{}ms] [Fault Manager] Exit.", simulation_elapsed(&simulation_start)),
+                );
                 return;
             }
             _ = sleep(Duration::from_millis(50)) => {}
@@ -1002,27 +1213,28 @@ async fn fault_manager_task(
         {
             let interlock_ms = t0.elapsed().as_millis() as u64;
 
-            // Lock metrics briefly, then release
-            metrics.lock().unwrap().interlock_latency_ms.push(interlock_ms);  // (lab 2)
+            // Lock metrics briefly, then release (lab 2)
+            metrics.lock().unwrap().interlock_latency.push(interlock_ms);
 
-            if interlock_ms > FAULT_RESPONSE_LIMIT_MS
+            if interlock_ms > FAULT_RESPONSE_LIMIT
             {
                 let alert = format!(
-                    "[{}ms] !!! CRITICAL ALERT !!! Interlock {interlock_ms}ms > {FAULT_RESPONSE_LIMIT_MS}ms",
-                    now_ms()
+                    "[{}ms] !!! CRITICAL ALERT !!! Interlock {interlock_ms}ms > {FAULT_RESPONSE_LIMIT}ms",
+                    simulation_elapsed(&simulation_start)
                 );
-                println!("{alert}");
+                print_and_log(&runtime_logger, &alert);
+                metrics.lock().unwrap().critical_alerts.push(alert);
 
-                // Lock metrics briefly, then release
-                metrics.lock().unwrap().critical_alerts.push(alert);  // (lab 2)
-
-                // Lock state to write — safe now because NO other lock is held
+                // Lock state to write — safe now because NO other lock is held (lab 2)
                 {
-                    let mut s = state.lock().unwrap();  // (lab 2 — Arc<Mutex<T>> write)
+                    let mut s = state.lock().unwrap();
                     s.fault_active      = false;
                     s.fault_detected_at = None;
-                }  // lock released here
-                println!("[FaultMgr] Interlock auto-cleared.");
+                }
+                print_and_log(
+                    &runtime_logger,
+                    &format!("[{}ms] [Fault Manager] Interlock auto-cleared.", simulation_elapsed(&simulation_start)),
+                );
             }
         }
     }
@@ -1036,24 +1248,33 @@ async fn fault_manager_task(
 //  Shorter period = higher priority = runs more often.
 //
 //  Each task follows this pattern:
-//    1. tokio::select! { shutdown | sleep(period) }           (Lab 8)
-//    2. Check fault_active — reject if faulted                (Lab 7)
-//    3. Construct GcsMode::<Normal>::new() only when OK        (Lab 7)
-//    4. Call dispatch_command(&mode, ...) — compile enforced   (Lab 7)
-//    5. Encode command with serde_json::to_string(&GcsCmd{..}) (serde)
-//    6. Measure and record jitter                             (Lab 2)
+//    1. tokio::select! { shutdown | sleep(period) }                   (Lab 8)
+//    2. Check fault_active — reject if faulted                        (Lab 7)
+//    3. Construct GcsMode::<Normal>::new() only when OK               (Lab 7)
+//    4. Call dispatch_command(&mode, ...) — compile enforced          (Lab 7)
+//    5. Encode command with serde_json::to_string(&GcsCommand{..})    (serde)
+//    6. Measure and record jitter using .as_micros()                  (Lab 2)
 // =============================================================================
 
 // ── Thermal Check (RM P1) — fires every 50ms ─────────────────────────────────
 async fn thermal_command_task(
-    cmd_tx:   mpsc::Sender<UplinkCmd>,
-    state:    Arc<Mutex<GcsState>>,
-    metrics:  Arc<Mutex<GcsMetrics>>,
-    shutdown: CancellationToken,
+    cmd_tx:           mpsc::Sender<UplinkCmd>,
+    state:            Shared<GcsState>,
+    metrics:          Shared<GcsMetrics>,
+    runtime_logger:   Shared<File>,
+    simulation_start: Instant,
+    shutdown:         CancellationToken,
 )
 {
     // This is the heartbeat() pattern from Lab 6 — a periodic async task
-    println!("[ThermalCmd] period={}ms  RM-P1", THERMAL_CMD_PERIOD_MS);
+    print_and_log(
+        &runtime_logger,
+        &format!(
+            "[{}ms] [Thermal Command] Started.  period={}ms  RM-P1",
+            simulation_elapsed(&simulation_start),
+            THERMAL_COMMAND_PERIOD
+        ),
+    );
 
     let mut iter:      u64     = 0;
     let task_start:    Instant = Instant::now();  // lab 3 — reference for drift
@@ -1068,34 +1289,34 @@ async fn thermal_command_task(
         {
             _ = shutdown.cancelled() =>
             {
-                println!("[ThermalCmd] Exit.");
+                print_and_log(
+                    &runtime_logger,
+                    &format!("[{}ms] [Thermal Command] Exit.", simulation_elapsed(&simulation_start)),
+                );
                 return;
             }
-            _ = sleep(Duration::from_millis(THERMAL_CMD_PERIOD_MS)) => {}
+            _ = sleep(Duration::from_millis(THERMAL_COMMAND_PERIOD)) => {}
         }
 
-        // ── Jitter Calculation (Lab 2) ────────────────────────────────────────
-        let expected_ms = iter * THERMAL_CMD_PERIOD_MS;
-        let actual_ms   = task_start.elapsed().as_millis() as u64;
-        let drift_ms    = actual_ms as i64 - expected_ms as i64;
+        // ── Drift (Lab 2) — how far behind/ahead of the ideal schedule ────────
+        let expected_time  = iter * THERMAL_COMMAND_PERIOD;
+        let actual_time    = task_start.elapsed().as_millis() as u64;
+        let drift_timing = actual_time as i64 - expected_time as i64;
 
-        // ── Jitter (lab 2) — variation between consecutive intervals ─────────────
-        // HOW IT WORKS:
-        // last_tick records when the previous iteration ran.
-        // this_interval_ms = how long it actually took between ticks.
-        // jitter = |actual_interval - expected_period|
-        // If the task fires exactly on time every 50ms → jitter = 0µs
-        // If the task fires at 50ms then 53ms → jitter on tick 2 = 3000µs
-        let this_interval_ms = last_tick.elapsed().as_millis() as i64;
-        let jitter_us = ((this_interval_ms - THERMAL_CMD_PERIOD_MS as i64) * 1_000).unsigned_abs() as i64;
+        // ── Jitter (Lab 2) — variation between consecutive intervals ──────────
+        // .as_micros() used here: jitter is a short duration where microsecond
+        // precision is meaningful. Milliseconds would lose too much resolution.
+        let this_interval = last_tick.elapsed().as_micros() as i64;
+        let jitter_timing = (this_interval - (THERMAL_COMMAND_PERIOD as i64 * 1000)).unsigned_abs() as i64;
         last_tick = Instant::now();
+
         if state.lock().unwrap().fault_active
         {
             let rej = format!(
                 "[{}ms] [REJECT] ThermalCheck iter={iter} — FaultLocked",
-                now_ms()
+                simulation_elapsed(&simulation_start)
             );
-            println!("{rej}");
+            print_and_log(&runtime_logger, &rej);
             let mut m = metrics.lock().unwrap();
             m.commands_rejected += 1;
             m.rejection_log.push(rej);
@@ -1109,42 +1330,46 @@ async fn thermal_command_task(
         let mode = GcsMode::<Normal>::new();
 
         // serde: build a typed command struct, no manual JSON string escaping
-        let payload = encode_cmd(&GcsCmd
+        let payload = encode_command(&GcsCommand
         {
-            tag:      "cmd".into(),
-            student:  STUDENT_ID.into(),
-            cmd:      "ThermalCheck".into(),
-            ts:       now_ms(),
-            priority: Some(1),
-            iter:     Some(iter),
-            generation:      None,
+            tag:        "cmd".into(),
+            cmd:        "ThermalCheck".into(),
+            ts:         simulation_elapsed(&simulation_start),
+            priority:   Some(1),
+            iter:       Some(iter),
+            generation: None,
         });
 
         // Lab 7: dispatch_command takes &GcsMode<Normal> — compile-time safety
         dispatch_command(&mode, &cmd_tx, payload, 1);
 
-        if jitter_us > UPLINK_JITTER_LIMIT_US
+        if jitter_timing > UPLINK_JITTER_LIMIT
         {
-            let v = format!(
-                "[{}ms] [WARN] ThermalCmd jitter {jitter_us}µs iter={iter}",
-                now_ms()
+            let warning = format!(
+                "[{}ms] [WARN] Thermal Command jitter {}µs iter={iter}",
+                simulation_elapsed(&simulation_start),
+                jitter_timing
             );
-            println!("{v}");
-            metrics.lock().unwrap().deadline_violations.push(v);
+            print_and_log(&runtime_logger, &warning);
+            metrics.lock().unwrap().deadline_violations.push(warning);
         }
 
         {
             let mut m = metrics.lock().unwrap();
-            m.thermal_jitter_us.push(jitter_us);
-            m.drift_ms.push(drift_ms);
+            m.thermal_jitter.push(jitter_timing);
+            m.drift_timing.push(drift_timing);
             m.active_ms  += t0.elapsed().as_millis() as u64;
-            m.elapsed_ms  = task_start.elapsed().as_millis() as u64;
+            m.elapsed_time  = task_start.elapsed().as_millis() as u64;
         }
 
         if iter % 20 == 0
         {
-            println!(
-                "[ThermalCmd] iter={iter:>4}  drift={drift_ms:+}ms  jitter={jitter_us}µs"
+            write_runtime_log(
+                &runtime_logger,
+                &format!(
+                    "[{}ms] [Thermal Command] iter={iter:>4}  drift={drift_timing:+}ms  jitter={jitter_timing}µs",
+                    simulation_elapsed(&simulation_start)
+                ),
             );
         }
 
@@ -1152,19 +1377,29 @@ async fn thermal_command_task(
     }
 }
 
-// ── Velocity Check (RM P2) — fires every 120ms ────────────────────────────────
-async fn velocity_command_task(
-    cmd_tx:   mpsc::Sender<UplinkCmd>,
-    state:    Arc<Mutex<GcsState>>,
-    metrics:  Arc<Mutex<GcsMetrics>>,
-    shutdown: CancellationToken,
+// ── Accelerometer Check (RM P2) — fires every 120ms ─────────────────────────── // variable name changed
+async fn accelerometer_command_task( // variable name changed
+    cmd_tx:           mpsc::Sender<UplinkCmd>,
+    state:            Shared<GcsState>,
+    metrics:          Shared<GcsMetrics>,
+    runtime_logger:   Shared<File>,
+    simulation_start: Instant,
+    shutdown:         CancellationToken,
 )
 {
-    println!("[VelocityCmd] period={}ms  RM-P2", VELOCITY_CMD_PERIOD_MS);
+    print_and_log(
+        &runtime_logger,
+        &format!(
+            "[{}ms] [Accelerometer Command] Started.  period={}ms  RM-P2", // variable name changed
+            simulation_elapsed(&simulation_start),
+            ACCELEROMETER_COMMAND_PERIOD
+        ),
+    );
 
-    let mut iter:   u64     = 0;
-    let task_start: Instant = Instant::now();
+    let mut iter:      u64     = 0;
+    let task_start:    Instant = Instant::now();
     let mut last_tick: Instant = Instant::now();
+
     loop
     {
         let t0 = Instant::now();
@@ -1173,35 +1408,32 @@ async fn velocity_command_task(
         {
             _ = shutdown.cancelled() =>
             {
-                println!("[VelocityCmd] Exit.");
+                print_and_log(
+                    &runtime_logger,
+                    &format!("[{}ms] [Accelerometer Command] Exit.", simulation_elapsed(&simulation_start)), // variable name changed
+                );
                 return;
             }
-            _ = sleep(Duration::from_millis(VELOCITY_CMD_PERIOD_MS)) => {}
+            _ = sleep(Duration::from_millis(ACCELEROMETER_COMMAND_PERIOD)) => {}
         }
 
-        let expected_ms = iter * VELOCITY_CMD_PERIOD_MS;
-        let actual_ms   = task_start.elapsed().as_millis() as u64;
-        let drift_ms    = actual_ms as i64 - expected_ms as i64;
+        let expected_time  = iter * ACCELEROMETER_COMMAND_PERIOD;
+        let actual_time    = task_start.elapsed().as_millis() as u64;
+        let drift_timing = actual_time as i64 - expected_time as i64;
 
-        // ── Jitter (lab 2) — variation between consecutive intervals ─────────────
-        // HOW IT WORKS:
-        // last_tick records when the previous iteration ran.
-        // this_interval_ms = how long it actually took between ticks.
-        // jitter = |actual_interval - expected_period|
-        // If the task fires exactly on time every 50ms → jitter = 0µs
-        // If the task fires at 50ms then 53ms → jitter on tick 2 = 3000µs
-        let this_interval_ms = last_tick.elapsed().as_millis() as i64;
-        let jitter_us = ((this_interval_ms - VELOCITY_CMD_PERIOD_MS as i64) * 1_000).unsigned_abs() as i64;
+        // .as_micros() for jitter — short duration, microsecond precision needed
+        let this_interval = last_tick.elapsed().as_micros() as i64;
+        let jitter_timing = (this_interval - (ACCELEROMETER_COMMAND_PERIOD as i64 * 1000)).unsigned_abs() as i64;
         last_tick = Instant::now();
 
         // Lab 7: reject if faulted
         if state.lock().unwrap().fault_active
         {
             let rej = format!(
-                "[{}ms] [REJECT] VelocityCheck iter={iter} — FaultLocked",
-                now_ms()
+                "[{}ms] [REJECT] AccelerometerCheck iter={iter} — FaultLocked", // variable name changed
+                simulation_elapsed(&simulation_start)
             );
-            println!("{rej}");
+            print_and_log(&runtime_logger, &rej);
             let mut m = metrics.lock().unwrap();
             m.commands_rejected += 1;
             m.rejection_log.push(rej);
@@ -1210,30 +1442,33 @@ async fn velocity_command_task(
         }
 
         let mode    = GcsMode::<Normal>::new();
-        let payload = encode_cmd(&GcsCmd
+        let payload = encode_command(&GcsCommand
         {
-            tag:      "cmd".into(),
-            student:  STUDENT_ID.into(),
-            cmd:      "VelocityCheck".into(),
-            ts:       now_ms(),
-            priority: Some(2),
-            iter:     Some(iter),
-            generation:      None,
+            tag:        "cmd".into(),
+            cmd:        "AccelerometerCheck".into(), // variable name changed
+            ts:         simulation_elapsed(&simulation_start),
+            priority:   Some(2),
+            iter:       Some(iter),
+            generation: None,
         });
 
         dispatch_command(&mode, &cmd_tx, payload, 2);
 
         {
             let mut m = metrics.lock().unwrap();
-            m.velocity_jitter_us.push(jitter_us);
-            m.drift_ms.push(drift_ms);
+            m.accelerometer_jitter.push(jitter_timing); // variable name changed
+            m.drift_timing.push(drift_timing);
             m.active_ms += t0.elapsed().as_millis() as u64;
         }
 
         if iter % 8 == 0
         {
-            println!(
-                "[VelocityCmd] iter={iter:>4}  drift={drift_ms:+}ms  jitter={jitter_us}µs"
+            write_runtime_log(
+                &runtime_logger,
+                &format!(
+                    "[{}ms] [Accelerometer Command] iter={iter:>4}  drift={drift_timing:+}ms  jitter={jitter_timing}µs", // variable name changed
+                    simulation_elapsed(&simulation_start)
+                ),
             );
         }
 
@@ -1243,7 +1478,7 @@ async fn velocity_command_task(
 
 
 // =============================================================================
-//  LAB 8 PART 1 — FRAGILE ATTITUDE DISPATCHER
+//  LAB 8 PART 1 — FRAGILE GYROSCOPE DISPATCHER  // variable name changed
 //
 //  This is the fragile_worker pattern from Lab 8 applied to an async task.
 //  It has a 2% random chance of panicking each iteration, simulating a
@@ -1253,58 +1488,64 @@ async fn velocity_command_task(
 //  supervisor detects the panic and restarts it.
 // =============================================================================
 
-async fn fragile_attitude_dispatcher(
-    generation: u32,
-    cmd_tx:     mpsc::Sender<UplinkCmd>,
-    state:      Arc<Mutex<GcsState>>,
-    metrics:    Arc<Mutex<GcsMetrics>>,
+async fn fragile_gyroscope_dispatcher( // variable name changed
+    generation:       u32,
+    cmd_tx:           mpsc::Sender<UplinkCmd>,
+    state:            Shared<GcsState>,
+    metrics:          Shared<GcsMetrics>,
+    runtime_logger:   Shared<File>,
+    simulation_start: Instant,
 )
 {
-    println!(
-        "[AttCmd-{generation}]  period={}ms  RM-P3  fragile",
-        ATTITUDE_CMD_PERIOD_MS
+    print_and_log(
+        &runtime_logger,
+        &format!(
+            "[{}ms] [Gyroscope Command-{generation}] Started.  period={}ms  RM-P3  fragile", // variable name changed
+            simulation_elapsed(&simulation_start),
+            GYROSCOPE_COMMAND_PERIOD
+        ),
     );
 
-    let mut iter:   u64     = 0;
-    let task_start: Instant = Instant::now();
+    let mut iter:      u64     = 0;
+    let task_start:    Instant = Instant::now();
     let mut last_tick: Instant = Instant::now();
 
     loop
     {
         // Lab 6: async sleep — yields execution so other tasks can run
-        sleep(Duration::from_millis(ATTITUDE_CMD_PERIOD_MS)).await;
+        sleep(Duration::from_millis(GYROSCOPE_COMMAND_PERIOD)).await;
 
         // Lab 8: 2% random panic (fragile_worker pattern from Lab 8)
         if rand::random_range(0u32..100) < 2
         {
-            println!("[AttCmd-{generation}]  Transmitter glitch — panicking!");
-            panic!("Attitude dispatcher fault (gen {generation})");
-            // attitude_supervisor_task catches this via handle.await returning Err
+            print_and_log(
+                &runtime_logger,
+                &format!(
+                    "[{}ms] [Gyroscope Command-{generation}] Transmitter glitch — panicking!", // variable name changed
+                    simulation_elapsed(&simulation_start)
+                ),
+            );
+            panic!("Gyroscope dispatcher fault (gen {generation})"); // variable name changed
+            // gyroscope_supervisor_task catches this via handle.await returning Err
         }
 
-        let expected_ms = iter * ATTITUDE_CMD_PERIOD_MS;
-        let actual_ms   = task_start.elapsed().as_millis() as u64;
-        let drift_ms    = actual_ms as i64 - expected_ms as i64;
+        let expected_time  = iter * GYROSCOPE_COMMAND_PERIOD;
+        let actual_time    = task_start.elapsed().as_millis() as u64;
+        let drift_timing = actual_time as i64 - expected_time as i64;
 
-        // ── Jitter (lab 2) — variation between consecutive intervals ─────────────
-        // HOW IT WORKS:
-        // last_tick records when the previous iteration ran.
-        // this_interval_ms = how long it actually took between ticks.
-        // jitter = |actual_interval - expected_period|
-        // If the task fires exactly on time every 50ms → jitter = 0µs
-        // If the task fires at 50ms then 53ms → jitter on tick 2 = 3000µs
-        let this_interval_ms = last_tick.elapsed().as_millis() as i64;
-        let jitter_us = ((this_interval_ms - ATTITUDE_CMD_PERIOD_MS as i64) * 1_000).unsigned_abs() as i64;
+        // .as_micros() for jitter — short duration, microsecond precision needed
+        let this_interval = last_tick.elapsed().as_micros() as i64;
+        let jitter_timing = (this_interval - (GYROSCOPE_COMMAND_PERIOD as i64 * 1000)).unsigned_abs() as i64;
         last_tick = Instant::now();
 
         // Lab 7: reject if faulted
         if state.lock().unwrap().fault_active
         {
             let rej = format!(
-                "[{}ms] [REJECT] AttitudeCheck gen={generation} iter={iter}",
-                now_ms()
+                "[{}ms] [REJECT] GyroscopeCheck gen={generation} iter={iter}", // variable name changed
+                simulation_elapsed(&simulation_start)
             );
-            println!("{rej}");
+            print_and_log(&runtime_logger, &rej);
             let mut m = metrics.lock().unwrap();
             m.commands_rejected += 1;
             m.rejection_log.push(rej);
@@ -1313,29 +1554,32 @@ async fn fragile_attitude_dispatcher(
         }
 
         let mode    = GcsMode::<Normal>::new();
-        let payload = encode_cmd(&GcsCmd
+        let payload = encode_command(&GcsCommand
         {
-            tag:       "cmd".into(),
-            student:   STUDENT_ID.into(),
-            cmd:       "AttitudeCheck".into(),
-            ts:        now_ms(),
-            priority:  Some(3),
-            iter:      Some(iter),
-            generation:Some(generation),
+            tag:        "cmd".into(),
+            cmd:        "GyroscopeCheck".into(), // variable name changed
+            ts:         simulation_elapsed(&simulation_start),
+            priority:   Some(3),
+            iter:       Some(iter),
+            generation: Some(generation),
         });
 
         dispatch_command(&mode, &cmd_tx, payload, 3);
 
         {
             let mut m = metrics.lock().unwrap();
-            m.attitude_jitter_us.push(jitter_us);
-            m.drift_ms.push(drift_ms);
+            m.gyroscope_jitter.push(jitter_timing); // variable name changed
+            m.drift_timing.push(drift_timing);
         }
 
         if iter % 3 == 0
         {
-            println!(
-                "[AttCmd-{generation}]  iter={iter:>4}  drift={drift_ms:+}ms  jitter={jitter_us}µs"
+            write_runtime_log(
+                &runtime_logger,
+                &format!(
+                    "[{}ms] [Gyroscope Command-{generation}] iter={iter:>4}  drift={drift_timing:+}ms  jitter={jitter_timing}µs", // variable name changed
+                    simulation_elapsed(&simulation_start)
+                ),
             );
         }
 
@@ -1345,7 +1589,7 @@ async fn fragile_attitude_dispatcher(
 
 
 // =============================================================================
-//  LAB 8 PART 2 — ATTITUDE SUPERVISOR  (async version of Lab 8 supervisor)
+//  LAB 8 PART 2 — GYROSCOPE SUPERVISOR  (async version of Lab 8 supervisor) // variable name changed
 //
 //  Mirrors the gyro_supervisor_thread in OCS, but runs as a Tokio task.
 //  Uses tokio::spawn instead of thread::spawn, and .await instead of .join().
@@ -1358,14 +1602,22 @@ async fn fragile_attitude_dispatcher(
 //    }
 // =============================================================================
 
-async fn attitude_supervisor_task(
-    cmd_tx:   mpsc::Sender<UplinkCmd>,
-    state:    Arc<Mutex<GcsState>>,
-    metrics:  Arc<Mutex<GcsMetrics>>,
-    shutdown: CancellationToken,
+async fn gyroscope_supervisor_task( // variable name changed
+    cmd_tx:           mpsc::Sender<UplinkCmd>,
+    state:            Shared<GcsState>,
+    metrics:          Shared<GcsMetrics>,
+    runtime_logger:   Shared<File>,
+    simulation_start: Instant,
+    shutdown:         CancellationToken,
 )
 {
-    println!("[AttSup]   Supervisor online.");
+    print_and_log(
+        &runtime_logger,
+        &format!(
+            "[{}ms] [Gyroscope Supervisor] Supervisor online.",
+            simulation_elapsed(&simulation_start)
+        ),
+    );
 
     let mut generation: u32 = 0;
 
@@ -1374,19 +1626,30 @@ async fn attitude_supervisor_task(
         // Check if we should exit before spawning a new generation
         if shutdown.is_cancelled()
         {
-            println!("[AttSup]   Exit.");
+            print_and_log(
+                &runtime_logger,
+                &format!("[{}ms] [Gyroscope Supervisor] Exit.", simulation_elapsed(&simulation_start)),
+            );
             return;
         }
 
         generation += 1;
-        println!("[AttSup]   Starting generation {generation}...");
+        print_and_log(
+            &runtime_logger,
+            &format!(
+                "[{}ms] [Gyroscope Supervisor] Starting generation {generation}...",
+                simulation_elapsed(&simulation_start)
+            ),
+        );
 
         // Lab 8: spawn the fragile dispatcher as a new async task
-        let handle = tokio::spawn(fragile_attitude_dispatcher(
+        let handle = tokio::spawn(fragile_gyroscope_dispatcher( // variable name changed
             generation,
             cmd_tx.clone(),
             Arc::clone(&state),
             Arc::clone(&metrics),
+            Arc::clone(&runtime_logger),
+            simulation_start,
         ));
 
         // Lab 8: match handle.await to detect panic vs normal exit
@@ -1395,14 +1658,23 @@ async fn attitude_supervisor_task(
             Ok(_) =>
             {
                 // Normal exit — shouldn't happen in loop{}, means it was cancelled
-                println!("[AttSup]   Normal exit — done.");
+                print_and_log(
+                    &runtime_logger,
+                    &format!("[{}ms] [Gyroscope Supervisor] Normal exit — done.", simulation_elapsed(&simulation_start)),
+                );
                 return;
             }
             Err(e) if e.is_panic() =>
             {
                 // Panic detected — same restart logic as Lab 8
-                metrics.lock().unwrap().attitude_restarts += 1;
-                println!("[AttSup]   Panic! Restarting in 1s...");
+                metrics.lock().unwrap().gyroscope_restarts += 1; // variable name changed
+                print_and_log(
+                    &runtime_logger,
+                    &format!(
+                        "[{}ms] [Gyroscope Supervisor] Panic detected! Restarting in 1s...",
+                        simulation_elapsed(&simulation_start)
+                    ),
+                );
 
                 // Lab 8: backoff before restarting
                 sleep(Duration::from_secs(1)).await;
@@ -1410,7 +1682,10 @@ async fn attitude_supervisor_task(
             Err(_) =>
             {
                 // Cancelled — clean exit
-                println!("[AttSup]   Cancelled.");
+                print_and_log(
+                    &runtime_logger,
+                    &format!("[{}ms] [Gyroscope Supervisor] Cancelled.", simulation_elapsed(&simulation_start)),
+                );
                 return;
             }
         }
@@ -1426,10 +1701,12 @@ async fn attitude_supervisor_task(
 // =============================================================================
 
 async fn metrics_reporter_task(
-    metrics:  Arc<Mutex<GcsMetrics>>,
-    state:    Arc<Mutex<GcsState>>,
-    backlog_counter: Arc<Mutex<usize>>,           // NEW (lab 2)
-    shutdown: CancellationToken,
+    metrics:          Shared<GcsMetrics>,
+    state:            Shared<GcsState>,
+    backlog_counter:  Shared<usize>,
+    runtime_logger:   Shared<File>,
+    simulation_start: Instant,
+    shutdown:         CancellationToken,
 )
 {
     loop
@@ -1448,63 +1725,61 @@ async fn metrics_reporter_task(
             if depth > m.backlog_peak { m.backlog_peak = depth; }
         }
 
-        print_report(&metrics.lock().unwrap(), &state.lock().unwrap());
+        print_report(
+            &metrics.lock().unwrap(),
+            &state.lock().unwrap(),
+            &simulation_start,
+        );
     }
 }
 
-fn print_report(m: &GcsMetrics, s: &GcsState)
+fn print_report(m: &GcsMetrics, s: &GcsState, simulation_start: &Instant)
 {
+    let elapsed_time = simulation_start.elapsed().as_millis();
+
     let reject_pct = if m.commands_sent + m.commands_rejected > 0
     {
         m.commands_rejected as f64
             / (m.commands_sent + m.commands_rejected) as f64
             * 100.0
     }
-    else
-    {
-        0.0
-    };
+    else { 0.0 };
 
-    let cpu = if m.elapsed_ms > 0
+    let cpu = if m.elapsed_time > 0
     {
-        m.active_ms as f64 / m.elapsed_ms as f64 * 100.0
+        m.active_ms as f64 / m.elapsed_time as f64 * 100.0
     }
+    else { 0.0 };
+
+    let avg_depth = if m.backlog_depth_samples.is_empty() { 0.0 }
     else
     {
-        0.0
+        m.backlog_depth_samples.iter().sum::<usize>() as f64
+            / m.backlog_depth_samples.len() as f64
     };
-
-    // backlog depth report  (lab 11 — queue utilisation, lab 2 — shared state)
-    let avg_depth = if m.backlog_depth_samples.is_empty() { 0.0 }
-        else
-        {
-            m.backlog_depth_samples.iter().sum::<usize>() as f64
-                / m.backlog_depth_samples.len() as f64
-        };
-
-    println!(
-        "║  Backlog depth  avg={:.1}  peak={}  channel_cap=100",
-        avg_depth, m.backlog_peak
-    );
 
     println!("\n╔══════════════════════════════════════════════════════╗");
-    println!( "║  GCS REPORT  at {}ms", now_ms());
+    println!( "║  GCS REPORT  at {elapsed_time}ms simulation time");
     println!( "╠══════════════════════════════════════════════════════╣");
     println!(
-        "║  Mode: {}  LoC: {}  Att restarts: {}",
+        "║  Mode: {}  LoC: {}  Gyroscope restarts: {}", // variable name changed
         if s.fault_active { "FaultLocked" } else { "Normal" },
         s.loss_of_contact,
-        m.attitude_restarts
+        m.gyroscope_restarts // variable name changed
     );
     println!(
         "║  Telemetry: rx={}  missed={}",
         m.telemetry_received, m.missed_packets
     );
     println!(
-        "║  Decode latency (µs)  deadline={}ms  (spawn_blocking)",
-        DECODE_DEADLINE_MS
+        "║  Backlog depth  avg={:.1}  peak={}  channel_cap=100",
+        avg_depth, m.backlog_peak
     );
-    let dl: Vec<i64> = m.decode_latency_us.iter().map(|&v| v as i64).collect();
+    println!(
+        "║  Decode latency (µs)  deadline={}ms  (spawn_blocking)",
+        DECODE_DEADLINE
+    );
+    let dl: Vec<i64> = m.decode_latency.iter().map(|&v| v as i64).collect();
     print_stat_row("Decode (µs)", &dl);
     println!(
         "║  Commands  sent={}  rejected={} ({:.1}%)",
@@ -1512,23 +1787,23 @@ fn print_report(m: &GcsMetrics, s: &GcsState)
     );
     println!(
         "║  Dispatch latency (µs)  deadline={}ms",
-        DISPATCH_DEADLINE_MS
+        DISPATCH_DEADLINE
     );
-    let disp: Vec<i64> = m.dispatch_latency_us.iter().map(|&v| v as i64).collect();
+    let disp: Vec<i64> = m.dispatch_latency.iter().map(|&v| v as i64).collect();
     print_stat_row("Dispatch (µs)", &disp);
-    println!("║  Uplink jitter (µs)  limit={}µs", UPLINK_JITTER_LIMIT_US);
-    print_stat_row("ThermalCheck  RM-P1",  &m.thermal_jitter_us);
-    print_stat_row("VelocityCheck RM-P2",  &m.velocity_jitter_us);
-    print_stat_row("AttitudeCheck RM-P3",  &m.attitude_jitter_us);
+    println!("║  Uplink jitter (µs)  limit={}µs", UPLINK_JITTER_LIMIT);
+    print_stat_row("ThermalCheck       RM-P1", &m.thermal_jitter);
+    print_stat_row("AccelerometerCheck RM-P2", &m.accelerometer_jitter); // variable name changed
+    print_stat_row("GyroscopeCheck     RM-P3", &m.gyroscope_jitter);     // variable name changed
     println!("║  Drift (ms)");
-    print_stat_row("All tasks", &m.drift_ms);
+    print_stat_row("All tasks", &m.drift_timing);
     println!(
         "║  Faults: {}  Critical alerts: {}",
         m.faults_received, m.critical_alerts.len()
     );
-    if !m.interlock_latency_ms.is_empty()
+    if !m.interlock_latency.is_empty()
     {
-        let il: Vec<i64> = m.interlock_latency_ms.iter().map(|&v| v as i64).collect();
+        let il: Vec<i64> = m.interlock_latency.iter().map(|&v| v as i64).collect();
         print_stat_row("Interlock latency (ms)", &il);
     }
     println!("║  Deadline violations: {}", m.deadline_violations.len());
@@ -1578,15 +1853,27 @@ async fn main()
     println!("║  CT087-3-3  |  Student B  |  Soft RTS / Tokio         ║");
     println!("╚═══════════════════════════════════════════════════════╝\n");
 
-    // lab 2 — Arc<Mutex<T>> backlog depth counter
-    // incremented by udp_receiver_loop when a packet is sent into the channel
-    // decremented by telemetry_processor_task when a packet is consumed
-    let backlog_counter: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+    // ── Simulation start time ─────────────────────────────────────────────────
+    // All timestamps throughout the GCS are simulation-relative.
+    // simulation_elapsed(&simulation_start) gives ms since this moment.
+    // This matches OCS which also uses simulation-relative time.
+    let simulation_start = Instant::now();
+
+    // ── Runtime log file ──────────────────────────────────────────────────────
+    // High-frequency per-packet events go to the log file, not the terminal.
+    // Important events (faults, alerts, violations) go to both via print_and_log().
+    let runtime_logger = create_runtime_logger();
+    println!("[GCS] Runtime log → {RUNTIME_LOG_FILE}");
 
     // ── Shared State Setup ────────────────────────────────────────────────────
     // Lab 2: Arc<Mutex<T>> — shared ownership with mutual exclusion
     let state    = Arc::new(Mutex::new(GcsState::default()));
     let metrics  = Arc::new(Mutex::new(GcsMetrics::default()));
+
+    // lab 2 — Arc<Mutex<T>> backlog depth counter
+    // incremented by udp_receiver_loop on successful channel send
+    // decremented by telemetry_processor_task on each packet consumed
+    let backlog_counter: Shared<usize> = Arc::new(Mutex::new(0));
 
     // Lab 8: CancellationToken — clean shutdown signal sent to all tasks
     let shutdown = CancellationToken::new();
@@ -1595,7 +1882,7 @@ async fn main()
     // tokio::net::UdpSocket is the async version of the std::net::UdpSocket
     // used in Lab 9's blocking server code.
     let recv_sock = Arc::new(
-        UdpSocket::bind(GCS_TELEM_BIND)
+        UdpSocket::bind(GCS_TELEMETRY_BIND)
             .await
             .expect("[GCS] bind recv failed")
     );
@@ -1612,15 +1899,15 @@ async fn main()
     let (cmd_tx,       cmd_rx)     = mpsc::channel::<UplinkCmd>(50);
 
     println!("[GCS] Config:");
-    println!("      Receive          : {GCS_TELEM_BIND}  (serde_json decoded)");
-    println!("      Send to          : {OCS_CMD_ADDR}  (serde_json encoded)");
+    println!("      Receive          : {GCS_TELEMETRY_BIND}  (serde_json decoded)");
+    println!("      Send to          : {OCS_COMMAND_ADDRESS}  (serde_json encoded)");
     println!("      Typestate        : GcsMode<Normal/FaultLocked>  (Lab 7 PhantomData)");
     println!("      Decode           : spawn_blocking  (Lab 6 CPU-off-async)");
     println!(
-        "      RM periods       : thermal={}ms  vel={}ms  att={}ms",
-        THERMAL_CMD_PERIOD_MS, VELOCITY_CMD_PERIOD_MS, ATTITUDE_CMD_PERIOD_MS
+        "      RM periods       : thermal={}ms  accel={}ms  gyro={}ms", // variable name changed
+        THERMAL_COMMAND_PERIOD, ACCELEROMETER_COMMAND_PERIOD, GYROSCOPE_COMMAND_PERIOD
     );
-    println!("      Sim duration     : {SIM_DURATION_S}s\n");
+    println!("      Sim duration     : {SIMULATION_DURATION}s\n");
 
     // ── Lab 6: tokio::spawn for each subsystem ────────────────────────────────
     // Each spawn creates a lightweight async task (NOT an OS thread).
@@ -1628,69 +1915,104 @@ async fn main()
 
     // UDP receiver — listens for OCS telemetry, feeds the incoming channel
     tokio::spawn(udp_receiver_loop(
-        Arc::clone(&recv_sock), 
+        Arc::clone(&recv_sock),
         incoming_tx,
-        Arc::clone(&backlog_counter),  // NEW
-        shutdown.clone()
+        Arc::clone(&backlog_counter),
+        Arc::clone(&runtime_logger),
+        simulation_start,
+        shutdown.clone(),
     ));
 
     // UDP sender — consumes command queue, fires packets to OCS
     tokio::spawn(udp_sender_task(
-        cmd_rx, Arc::clone(&send_sock), Arc::clone(&metrics), shutdown.clone()
+        cmd_rx,
+        Arc::clone(&send_sock),
+        Arc::clone(&metrics),
+        Arc::clone(&runtime_logger),
+        simulation_start,
+        shutdown.clone(),
     ));
 
     // Telemetry processor — decodes packets (spawn_blocking) and routes them
     tokio::spawn(telemetry_processor_task(
-        incoming_rx, 
-        Arc::clone(&state), 
+        incoming_rx,
+        Arc::clone(&state),
         Arc::clone(&metrics),
-        cmd_tx.clone(), 
-        Arc::clone(&backlog_counter),  // NEW
+        cmd_tx.clone(),
+        Arc::clone(&backlog_counter),
+        Arc::clone(&runtime_logger),
+        simulation_start,
         shutdown.clone(),
     ));
 
     // Loss-of-contact monitor — watchdog for telemetry silence
     tokio::spawn(loss_of_contact_monitor_task(
-        Arc::clone(&state), Arc::clone(&metrics),
-        cmd_tx.clone(), shutdown.clone(),
+        Arc::clone(&state),
+        Arc::clone(&metrics),
+        cmd_tx.clone(),
+        Arc::clone(&runtime_logger),
+        simulation_start,
+        shutdown.clone(),
     ));
 
     // Fault manager — measures interlock response latency
     tokio::spawn(fault_manager_task(
-        Arc::clone(&state), Arc::clone(&metrics), shutdown.clone(),
+        Arc::clone(&state),
+        Arc::clone(&metrics),
+        Arc::clone(&runtime_logger),
+        simulation_start,
+        shutdown.clone(),
     ));
 
     // RM command tasks (Lab 7 typestate + Lab 8 supervisor)
     tokio::spawn(thermal_command_task(
-        cmd_tx.clone(), Arc::clone(&state), Arc::clone(&metrics), shutdown.clone(),
+        cmd_tx.clone(),
+        Arc::clone(&state),
+        Arc::clone(&metrics),
+        Arc::clone(&runtime_logger),
+        simulation_start,
+        shutdown.clone(),
     ));
 
-    tokio::spawn(velocity_command_task(
-        cmd_tx.clone(), Arc::clone(&state), Arc::clone(&metrics), shutdown.clone(),
+    tokio::spawn(accelerometer_command_task( // variable name changed
+        cmd_tx.clone(),
+        Arc::clone(&state),
+        Arc::clone(&metrics),
+        Arc::clone(&runtime_logger),
+        simulation_start,
+        shutdown.clone(),
     ));
 
-    // Attitude supervisor wraps the fragile dispatcher (Lab 8)
-    tokio::spawn(attitude_supervisor_task(
-        cmd_tx.clone(), Arc::clone(&state), Arc::clone(&metrics), shutdown.clone(),
+    // Gyroscope supervisor wraps the fragile dispatcher (Lab 8)
+    tokio::spawn(gyroscope_supervisor_task( // variable name changed
+        cmd_tx.clone(),
+        Arc::clone(&state),
+        Arc::clone(&metrics),
+        Arc::clone(&runtime_logger),
+        simulation_start,
+        shutdown.clone(),
     ));
 
     // Periodic metrics reporter
     tokio::spawn(metrics_reporter_task(
-        Arc::clone(&metrics), 
-        Arc::clone(&state), 
-        Arc::clone(&backlog_counter),  // NEW
+        Arc::clone(&metrics),
+        Arc::clone(&state),
+        Arc::clone(&backlog_counter),
+        Arc::clone(&runtime_logger),
+        simulation_start,
         shutdown.clone(),
     ));
 
     println!("[GCS] All tasks online.  Waiting for OCS telemetry...\n");
 
     // ── Run for the simulation duration ──────────────────────────────────────
-    sleep(Duration::from_secs(SIM_DURATION_S)).await;
+    sleep(Duration::from_secs(SIMULATION_DURATION)).await;
 
     // ── Lab 8: Graceful Shutdown via CancellationToken ────────────────────────
     // Calling shutdown.cancel() wakes every tokio::select! branch that is
     // waiting on shutdown.cancelled() — all tasks exit cleanly.
-    println!("\n[GCS] Simulation ended — shutting down...");
+    let total_time = simulation_start.elapsed().as_millis();
+    println!("\n[GCS] Simulation ended at {total_time}ms — shutting down...");
     shutdown.cancel();
 
     // Give tasks a moment to finish cleanup before printing the final report
@@ -1698,6 +2020,6 @@ async fn main()
 
     // Print final summary
     println!("\n[GCS] FINAL REPORT:");
-    print_report(&metrics.lock().unwrap(), &state.lock().unwrap());
-    println!("[GCS] Done.");
+    print_report(&metrics.lock().unwrap(), &state.lock().unwrap(), &simulation_start);
+    println!("[GCS] Done.  Full event log → {RUNTIME_LOG_FILE}");
 }
