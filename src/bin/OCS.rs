@@ -1,177 +1,129 @@
-// ── Standard Library Imports ─────────────────────────────────────────────────
-use std::collections::BinaryHeap;   // for priority queue (Lab 11)
+// SATELLITE ONBOARD CONTROL SYSTEM - BY LUVEN MARK (TP071542)
+// TYPE: HARD RTS, demonstrating the learnt Hard RTS concepts
+
+// Standard Library Imports
+use std::collections::BinaryHeap;   // for priority queue
 use std::fs::{File, OpenOptions};   // for runtime log file
 use std::io::Write;                 // for writing log lines
-use std::marker::PhantomData;       // for typestate pattern (Lab 7)
-use std::net::UdpSocket;            // for blocking UDP socket (Lab 9)
-use std::sync::{Arc, Mutex};        // for shared ownership across threads (Lab 2)
-use std::sync::mpsc;                // for message passing between threads (Lab 11)
-use std::thread;                    // for OS thread creation (Lab 2)
-use std::time::{Duration, Instant};
+use std::marker::PhantomData;       // for typestate
+use std::net::UdpSocket;            // for UDP
+use std::sync::{Arc, Mutex};        // for shared ownership across threads 
+use std::sync::mpsc;                // for message passing between threads
+use std::thread;                    // for OS thread creation (Hard RTS)
+use std::time::{Duration, Instant}; // for timing
 
-// ── External Crate Imports ────────────────────────────────────────────────────
-use rand;                                   // random number generation (Lab 8 fault simulation)
-use scheduled_thread_pool::ScheduledThreadPool; // thread pool for RM tasks (Lab 11)
-use serde::{Deserialize, Serialize};        // automatic JSON serialisation/deserialisation
-use serde_json;                             // JSON encode/decode for UDP payloads
+// Other Imports
+use scheduled_thread_pool::ScheduledThreadPool; // thread pool for Rate Monotonic Scheduling tasks
+use serde::{Deserialize, Serialize};            // automatic JSON serialisation/deserialisation
+use serde_json;                                 // JSON encode/decode for UDP payloads
+
+
+// ~~~~ SECTION 0: PRE-COMPILATION ~~~~~
+// ---- 1. CONSTANTS -----
+// Uses all caps with snake case due to warning
+
+// Sensor Sampling Periods (ms)
+const THERMAL_PERIOD: u64 = 25;         // highest priority sensor, fastest rate
+const ACCELEROMETER_PERIOD: u64 = 60;
+const GYROSCOPE_PERIOD: u64 = 175;      // Period (slides definition) = time between 2 tasks (interval)
  
+// Background Task Periods (ms)
+const HEALTH_MONITOR_PERIOD: u64 = 100;
+const DATA_COMPRESSION_PERIOD: u64 = 200;   
+const ANTENNA_ALIGNMENT_PERIOD: u64 = 500;
  
-// =============================================================================
-//  PART 0 — CONSTANTS   (Lab 1: const keyword)
-//
-//  Constants are declared with `const` instead of `let`.
-//  They must have an explicit type and cannot be mutable.
-//  They live for the entire program lifetime (no ownership).
-// =============================================================================
+// Safety Thresholds (Thermal = Critical Sensor)
+const THERMAL_JITTER_TIME_LIMIT: i64 = 1000;      // (μs) precise jitter measurement for critical sensor, max 1ms
+const THERMAL_MAX_MISSES: u32 = 3;                // for safety alert after 3 consecutive misses
+const PRIORITY_BUFFER: usize = 100;               // max items in the priority buffer
+const DEGRADED_MODE: f32 = 0.80;                  // degraded mode at 80% full
  
-// ── Sensor Sampling Periods (milliseconds) ────────────────────────────────────
-const THERMAL_SENSOR_PERIOD: u64 = 50;         // highest priority sensor, fastest rate
-const ACCELEROMETER_PERIOD: u64 = 120;
-const GYROSCOPE_PERIOD: u64 = 333;
+// Downlink (ms)
+const VISIBILITY_PERIOD: u64 = 10000;        // 10000ms = 10s
+const DOWNLINK_TIME_LIMIT: u64 = 30;     
+const INITIALISE_TIME_LIMIT: u64 = 5;      
  
-// ── Background Task Periods (milliseconds) ────────────────────────────────────
-const HEALTH_MONITOR_PERIOD: u64 = 200;
-const DATA_COMPRESSION_PERIOD: u64 = 500;
-const ANTENNA_ALIGNMENT_PERIOD: u64 = 1000;
+// Fault Injection & Simulation (ms)
+const FAULT_INJECTION_PERIOD: u64 = 60000;   // 60000ms = 60s
+const RECOVERY_TIME_LIMIT: u64 = 200;       
+const SIMULATION_DURATION: u64 = 180000;     // 180000ms = 180s = 3min to inject 3 faults
  
-// ── Timing and Safety Thresholds ─────────────────────────────────────────────
-const JITTER_WARNING_LIMIT_MICROSECONDS: i64 = 1000;  // warn if jitter exceeds 1ms
-const MAX_CONSECUTIVE_THERMAL_MISSES: u32 = 3;        // safety alert after 3 consecutive drops
-const PRIORITY_BUFFER_CAPACITY: usize = 100;          // max items in the priority buffer
-const DEGRADED_MODE_THRESHOLD: f32 = 0.80;            // enter degraded mode at 80% full
+// Pre-allocated worst case Vec capacities during compilation to avoiding unpredictable heap allocation latency
+const JITTER_MAX_SIZE: usize = 10000;
+const DRIFT_MAX_SIZE: usize = 20000;
+const LATENCY_MAX_SIZE: usize = 20000;
+const LOG_MAX_SIZE: usize = 500;
  
-// ── Downlink / Radio Parameters ───────────────────────────────────────────────
-const VISIBILITY_WINDOW_INTERVAL: u64 = 10;           // seconds
-const DOWNLINK_WINDOW_DURATION: u64 = 30;             // milliseconds
-const DOWNLINK_INITIALISATION_DEADLINE: u64 = 5;      // milliseconds
- 
-// ── Fault Injection and Simulation ───────────────────────────────────────────
-const FAULT_INJECTION_INTERVAL: u64 = 60;             // seconds
-const RECOVERY_TIME_LIMIT: u64 = 200;                // milliseconds
-const SIMULATION_DURATION_SECONDS: u64 = 180;        // 180 seconds = 3 minutes
- 
-// ── Lab 3: Pre-allocated capacities (no runtime realloc during simulation) ────
-// We call Vec::with_capacity() at startup so the Vec never needs to grow
-// during the simulation, avoiding unpredictable heap allocation latency.
-const MAX_JITTER_SAMPLES: usize = 10000;
-const MAX_DRIFT_SAMPLES: usize = 20000;
-const MAX_LATENCY_SAMPLES: usize = 20000;
-const MAX_LOG_ENTRIES: usize = 500;
- 
-// ── Network Addresses ─────────────────────────────────────────────────────────
+// UDP Communication
 const GCS_TELEMETRY_ADDRESS: &str = "127.0.0.1:9000";
-const OCS_COMMAND_BIND_ADDRESS: &str = "0.0.0.0:9001";
-const UDP_READ_TIMEOUT: u64 = 100;
+const OCS_COMMAND_ADDRESS: &str = "0.0.0.0:9001";
+const UDP_TIMEOUT: u64 = 100;
  
-// ── Runtime Log File ──────────────────────────────────────────────────────────
-const RUNTIME_LOG_FILE: &str = "ocs_runtime.log";
+// Simulation Log
+const LOG_FILE: &str = "ocs.log";
  
- 
-// =============================================================================
-//  SERDE MESSAGE TYPES
-//
-//  Every UDP payload the OCS sends is one of these enum variants.
-//  #[serde(tag = "tag")] writes {"tag":"thermal",...} on the wire —
-//  the same format as the old manual format! strings, but now the compiler
-//  checks every field name and type at compile time.
-//
-//  The GCS deserialises with serde_json::from_str::<OcsMessage>(&payload),
-//  matching on the same enum — no more payload.contains("\"tag\":\"alert\"").
-// =============================================================================
- 
-// The main message enum — each variant maps to a different telemetry type
+
+// ---- 2. DATA STRUCTURES ----
+
+// Main Message Enum to be serialised and sent to GCS
 #[derive(Serialize, Deserialize, Debug)]
-#[serde(tag = "tag", rename_all = "snake_case")]
-enum OcsMessage
+enum OCSMessage
 {
     Thermal
     {
-        seq: u64,
-        temp: f64,
-        drift_ms: i64,
+        sequence: u64,
+        temperature: f64,
+        drift: i64,
     },
  
-    Accel
+    Accelerometer
     {
-        seq: u64,
-        mag: f64,
+        sequence: u64,
+        velocity: f64,
+        drift: i64,
     },
  
-    Gyro
+    Gyroscope
     {
-        seq: u64,
-        omega_z: f64,
+        sequence: u64,
+        orientation: f64,
+        drift: i64,
     },
  
     Status
     {
-        iter: u64,
-        fill: f64,
+        iteration: u64,
+        fill: f64, 
         state: String,
-        drift_ms: i64,
+        drift: i64,
     },
  
     Downlink
     {
-        pkt: u64,
+        packet: u64,
         bytes: usize,
-        q_lat_ms: u64,
+        queue_latency: u64,
     },
  
-    // Alert uses #[serde(flatten)] so AlertInfo fields appear directly
-    // in the JSON object alongside "student" and "event", rather than nested.
     Alert
     {
         event: String,
-        #[serde(flatten)]
-        info: AlertInfo,
+        misses: Option<u32>,
+        count: Option<u32>,
+        fault_type: Option<String>,
     },
 }
  
-// Optional extra fields for Alert messages.
-// We use Option<T> so absent fields are omitted (skip_serializing_if) rather
-// than written as null — keeps the wire format clean.
-#[derive(Serialize, Deserialize, Debug, Default)]
-struct AlertInfo
-{
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub misses: Option<u32>,     // for thermal miss alerts
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub count: Option<u32>,      // fault occurrence count
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub fault_type: Option<String>, // e.g. "SensorBusHang", "PowerSpike"
-}
- 
-// Command messages arriving FROM the GCS. The OCS only needs tag/cmd/ts.
+// Command Message Enum to be deserialised from GCS
 #[derive(Serialize, Deserialize, Debug)]
-struct GcsCommand
+struct GCSCommand
 {
-    pub tag: String,      // always "cmd"
-    pub student: String,
-    pub cmd: String,      // e.g. "ThermalCheck", "EmergencyHalt"
-    pub ts: u64,          // simulation timestamp in ms (or sender-side timestamp)
+    pub tag: String,     
+    pub command: String,      // example is "ThermalCheck"
+    pub timestamp: u64,       // (ms) simulation time
 }
  
-// Helper: serialise an OcsMessage to a JSON string.
-// If encoding fails (shouldn't happen), logs the error and returns "".
-fn encode_message(message: &OcsMessage) -> String
-{
-    serde_json::to_string(message)
-        .unwrap_or_else(|error|
-        {
-            println!("[ENCODE] {error}");
-            String::new()
-        })
-}
- 
- 
-// =============================================================================
-//  DATA TYPES   (Lab 1: structs, enums)
-// =============================================================================
- 
-// Which physical sensor produced a reading
+// Types of Sensors, FYI Debug = Make it Printable, Clone = Make a copy
 #[derive(Debug, Clone, PartialEq)]
 enum SensorType
 {
@@ -181,57 +133,53 @@ enum SensorType
 }
  
 // One sensor measurement, timestamped and prioritised
-// Lab 1: struct with multiple fields and explicit types
 #[derive(Debug, Clone)]
 struct SensorReading
 {
     sensor_type: SensorType,
     value: f64,
-    timestamp_ms: u64,   // simulation-relative time in ms
+    timestamp: u64,      // (ms) simulation time
     priority: u8,        // lower number = higher priority (1 is most critical)
 }
- 
-// ── BinaryHeap ordering for SensorReading ────────────────────────────────────
-// Rust's BinaryHeap is a MAX-heap by default.
-// We flip the comparison so that LOWER priority numbers come out first
-// (i.e. priority 1 = thermal = most urgent pops before priority 3 = gyro).
-impl PartialEq for SensorReading
+
+// BinaryHeap Re-ordering as its a MAX-heap by default (prioritizing larger numbers first), flip the comparison so that LOWER numbers (higher priority) come out first
+// *follows lecture implementation
+impl Ord for SensorReading 
 {
-    fn eq(&self, other: &Self) -> bool
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering
+    {
+        other.priority.cmp(&self.priority) // Flip 'self' and 'other' to turn Max-Heap into Min-Heap
+    }
+}
+
+impl PartialOrd for SensorReading 
+{
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> 
+    {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for SensorReading 
+{
+    fn eq(&self, other: &Self) -> bool 
     {
         self.priority == other.priority
     }
 }
 impl Eq for SensorReading {}
  
-impl PartialOrd for SensorReading
-{
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering>
-    {
-        Some(self.cmp(other))
-    }
-}
- 
-impl Ord for SensorReading
-{
-    // Reverse the comparison: lower priority number → higher heap position
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering
-    {
-        other.priority.cmp(&self.priority)
-    }
-}
- 
-// A compressed packet ready for downlink transmission
+// Compressed packet ready for downlink transmission
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DataPacket
 {
-    packet_id: u64,
-    payload: String,      // serde_json batch of sensor readings
-    created_at_ms: u64,   // simulation-relative time when packet was queued
+    packetID: u64,
+    payload: String,     // serde_json of sensor readings
+    created_at: u64,     // (ms) simulation time when packet was queued
     size_bytes: usize,
-}
+} // XXX: remove?
  
-// Overall system health state (Lab 1: enum)
+// System health state
 #[derive(Debug, Clone, PartialEq)]
 enum SystemState
 {
@@ -239,109 +187,81 @@ enum SystemState
     Degraded,
     MissionAbort,
 }
- 
-// Types of faults the injector can simulate (Lab 7: enum FaultType)
-#[derive(Debug)]
-enum FaultType
-{
-    SensorBusHang(u64),   // payload = hang duration in ms
-    CorruptedReading,
-    PowerSpike,
-}
- 
- 
-// =============================================================================
-//  LAB 7 — RADIO TYPESTATE  (PhantomData<S>)
-//
-//  This is the same pattern as the Door typestate in Lab 7.
-//
-//  Door analogy → Radio analogy:
-//    Door<Locked>       →  Radio<Idle>
-//    Door<Unlocked>     →  Radio<Transmitting>
-//    door.unlock()      →  radio.initialise()
-//    door.lock()        →  radio returns to Idle after transmit()
-//
-//  The key point: calling .transmit() on Radio<Idle> is a COMPILE ERROR.
-//  The state machine is enforced at compile time, not runtime.
-//
-//  PhantomData<S> tells the compiler "this struct is parameterised by S"
-//  without storing any actual data for S at runtime (zero cost).
-// =============================================================================
- 
-// The two possible radio states
+  
+
+// 3. ---- TYPESTATES - for Radio (Downlink Thread) ----
+// With typestates, calling .transmit() when Idle is a compile error, enforcing state machine at compile time, not runtime
+
+// Two possible radio states
 struct Idle;
 struct Transmitting;
  
-// The generic Radio struct — S is the current state
+// Generic Radio struct - S is the current state
 struct Radio<S>
 {
-    _state: PhantomData<S>   // zero-size marker; only used by the type system
+    state: PhantomData<S>   // does not store any actual data for S at runtime (zero cost).
 }
  
-// Methods available ONLY when the radio is Idle
+// Methods ONLY when the radio is Idle
 impl Radio<Idle>
 {
-    // Create a new radio, always starts Idle
-    fn new() -> Self
+    fn new() -> Self  // Self is a type alias for Radio<Idle>
     {
-        Radio { _state: PhantomData }
+        Radio 
+        { 
+            state: PhantomData  // Create a new radio, always starts Idle
+        }
     }
  
-    // Idle → Transmitting.
-    // Returns None if hardware init exceeds the 5ms deadline (hard deadline).
-    fn initialise(
-        self,
-        simulation_start_time: &Instant,
-        runtime_logger: &Shared<File>,
-    ) -> Option<Radio<Transmitting>>
+    // Idle to Transmitting
+    fn initialise(self, simulation_start_time: &Instant, log: &Shared<File>) -> Option<Radio<Transmitting>>
     {
         let initialisation_start_time = Instant::now();
-        thread::sleep(Duration::from_millis(3));  // simulate hardware init delay
+        thread::sleep(Duration::from_millis(3));            // simulate hardware initialisation delay
  
-        let initialisation_duration_ms = initialisation_start_time.elapsed().as_millis() as u64;
+        let INITIALISE_TIME_LIMIT = initialisation_start_time.elapsed().as_millis() as u64;
  
-        if initialisation_duration_ms > DOWNLINK_INITIALISATION_DEADLINE
+        if initialisation_duration > INITIALISE_TIME_LIMIT
         {
-            let log_line = format!(
-                "[{}ms] [RADIO] Initialisation {}ms > {}ms — staying Idle",
-                simulation_elapsed_ms(simulation_start_time),
-                initialisation_duration_ms,
-                DOWNLINK_INITIALISATION_DEADLINE
+            let log_line = format!
+            (
+                "[{}ms] [RADIO DEADLINE] Initialisation {}ms > {}ms — staying Idle",
+                simulation_elapsed(simulation_start_time),
+                initialisation_duration,
+                INITIALISE_TIME_LIMIT
             );
  
-            // Deadline violation — always shown on terminal
-            print_and_log_important(runtime_logger, &log_line);
- 
-            None
+            // Deadline violation - shown on console
+            append_console_log(log, &log_line);
+            None        // Returns None if hardware init exceeds the 5ms hard deadline
         }
         else
         {
-            let log_line = format!(
-                "[{}ms] [RADIO] Initialisation OK ({}ms) — Transmitting",
-                simulation_elapsed_ms(simulation_start_time),
-                initialisation_duration_ms
+            let log_line = format!
+            (
+                "[{}ms] [RADIO] Initialisation OK ({}ms) - Transmitting",
+                simulation_elapsed(simulation_start_time),
+                initialisation_duration
             );
  
-            write_runtime_log(runtime_logger, &log_line);
+            append_log(log, &log_line);
  
-            Some(Radio { _state: PhantomData })
+            Some   // Returns Some  = radio is now Transmitting
+            (
+                Radio 
+                { 
+                    state: PhantomData 
+                }
+            )
         }
     }
 }
  
-// Methods available ONLY when the radio is Transmitting
+// Methods ONLY when the radio is Transmitting
 impl Radio<Transmitting>
 {
     // Transmit all queued packets, then return to Idle state.
-    // Note: self is consumed (moved), enforcing the state transition.
-    fn transmit(
-        self,
-        packets: &[DataPacket],
-        metrics: &Shared<SystemMetrics>,
-        udp_sender: &mpsc::Sender<String>,
-        simulation_start_time: &Instant,
-        runtime_logger: &Shared<File>,
-    ) -> Radio<Idle>
+    fn transmit(self, packets: &[DataPacket], metrics: &Shared<SystemMetrics>, udp_sender: &mpsc::Sender<String>, simulation_start_time: &Instant, log: &Shared<File>) -> Radio<Idle>
     {
         let transmission_start_time = Instant::now();
         let mut transmitted_packet_count = 0usize;
@@ -349,135 +269,134 @@ impl Radio<Transmitting>
  
         for packet in packets
         {
-            // Hard deadline: we must finish within the downlink window
-            if transmission_start_time.elapsed().as_millis() as u64 >= DOWNLINK_WINDOW_DURATION
+            if transmission_start_time.elapsed().as_millis() as u64 >= DOWNLINK_TIME_LIMIT
             {
-                let violation = format!(
+                let violation = format!
+                (
                     "[{}ms] [DEADLINE] Downlink window exceeded after {} packets",
-                    simulation_elapsed_ms(simulation_start_time),
+                    simulation_elapsed(simulation_start_time),
                     transmitted_packet_count
                 );
- 
-                println!("{violation}");
-                write_runtime_log(runtime_logger, &violation);
-                log_deadline_violation(metrics, violation);
-                break;
+
+                append_log(log, &violation);
+                append_deadline(metrics, violation);
+                break;              // Hard deadline, must finish within the downlink window
             }
  
             // Queue latency = time since this packet was created
-            let queue_latency_ms = simulation_elapsed_ms(simulation_start_time)
-                .saturating_sub(packet.created_at_ms);
- 
+            let queue_latency = simulation_elapsed(simulation_start_time).saturating_sub(packet.created_at); // .saturating_subtract() prevents underflow 
             total_transmitted_bytes += packet.size_bytes;
             transmitted_packet_count += 1;
  
-            let log_line = format!(
-                "[{}ms] [DOWNLINK] TX packet={}  {}B  q_lat={}ms",
-                simulation_elapsed_ms(simulation_start_time),
-                packet.packet_id,
+            let log_line = format!
+            (
+                "[{}ms] [DOWNLINK] Transmit packet={}  {}bytes queue_latency={}ms",
+                simulation_elapsed(simulation_start_time),
+                packet.packetID,
                 packet.size_bytes,
-                queue_latency_ms
+                queue_latency
             );
-            write_runtime_log(runtime_logger, &log_line);
+            append_log(log, &log_line);
  
-            // serde: send downlink metadata to GCS via UDP
-            send_ocs_message(
+            // Send downlink metadata to GCS via UDP, through serde
+            send_ocs_message
+            (
                 udp_sender,
-                OcsMessage::Downlink
+                OCSMessage::Downlink
                 {
-                    pkt: packet.packet_id,
+                    packet: packet.packetID,
                     bytes: packet.size_bytes,
-                    q_lat_ms: queue_latency_ms,
+                    queue_latency: queue_latency,
                 }
             );
         }
  
-        let transmission_duration_ms = transmission_start_time.elapsed().as_millis() as u64;
+        let transmission_duration = transmission_start_time.elapsed().as_millis() as u64;
  
-        let summary_line = format!(
-            "[{}ms] [DOWNLINK] Done  {}/{} packets  {}B  {}ms",
-            simulation_elapsed_ms(simulation_start_time),
+        let log_line = format!
+        (
+            "[{}ms] [DOWNLINK] Done  {}/{} packets  {}bytes {}ms",
+            simulation_elapsed(simulation_start_time),
             transmitted_packet_count,
             packets.len(),
             total_transmitted_bytes,
-            transmission_duration_ms
+            transmission_duration
         );
+        append_console_log(log, &log_line); //XXX: inform
  
-        println!("{summary_line}");
-        write_runtime_log(runtime_logger, &summary_line);
- 
-        // Return the Idle state — caller now holds Radio<Idle>
-        Radio { _state: PhantomData }
+        // Return the Idle state, caller now holds Radio<Idle>
+        Radio
+        { 
+            state: PhantomData
+        }
     }
 }
  
- 
-// =============================================================================
-//  SHARED METRICS  (Lab 3: Vec::with_capacity, no runtime realloc)
-// =============================================================================
- 
+
+// 4. ---- SYSTEM METRICS ----
+
+// System Metrics for Final Report
 struct SystemMetrics
 {
-    // Jitter samples per sensor (Lab 2: jitter = |actual - expected|)
-    thermal_jitter_microseconds: Vec<i64>,
-    accelerometer_jitter_microseconds: Vec<i64>,
-    gyroscope_jitter_microseconds: Vec<i64>,
+    // Jitter Samples per sensor (μs), where Jitter = |actual - expected|
+    thermal_jitter: Vec<i64>,
+    accelerometer_jitter: Vec<i64>,
+    gyroscope_jitter: Vec<i64>,
  
-    // Task scheduling drift and buffer insert latency (Lab 3)
-    drift_milliseconds: Vec<i64>,
-    insert_latency_microseconds: Vec<u64>,
+    // Scheduling drift & buffer insert latency
+    drift: Vec<i64>,
+    insert_latency: Vec<u64>,
  
-    // Recovery and fault tracking
-    recovery_times_milliseconds: Vec<u64>,
+    // Recovery & fault tracking
+    recovery_times: Vec<u64>,
     dropped_log: Vec<String>,
-    deadline_violations: Vec<String>,
+    deadline_log: Vec<String>,
     fault_log: Vec<String>,
     safety_alerts: Vec<String>,
  
     // Counters
-    total_received_readings: u64,
-    total_dropped_readings: u64,
-    consecutive_thermal_misses: u32,
-    active_time_milliseconds: u64,
-    elapsed_time_milliseconds: u64,
+    total_received: u64,
+    total_dropped: u64,
+    thermal_misses: u32,
+    active_time: u64,
+    elapsed_time: u64,
 }
  
 impl SystemMetrics
 {
-    fn new() -> Self
+    fn new() -> Self   // Self = SystemMetrics
     {
         SystemMetrics
         {
-            thermal_jitter_microseconds: Vec::with_capacity(MAX_JITTER_SAMPLES),
-            accelerometer_jitter_microseconds: Vec::with_capacity(MAX_JITTER_SAMPLES),
-            gyroscope_jitter_microseconds: Vec::with_capacity(MAX_JITTER_SAMPLES),
+            // Using Vec::with_capacity()  = no runtime reallocation, pre-allocated worst-case size
+            thermal_jitter: Vec::with_capacity(JITTER_MAX_SIZE),
+            accelerometer_jitter: Vec::with_capacity(JITTER_MAX_SIZE),
+            gyroscope_jitter: Vec::with_capacity(JITTER_MAX_SIZE),
  
-            drift_milliseconds: Vec::with_capacity(MAX_DRIFT_SAMPLES),
-            insert_latency_microseconds: Vec::with_capacity(MAX_LATENCY_SAMPLES),
+            drift: Vec::with_capacity(DRIFT_MAX_SIZE),
+            insert_latency: Vec::with_capacity(LATENCY_MAX_SIZE),
  
-            recovery_times_milliseconds: Vec::with_capacity(10),
-            dropped_log: Vec::with_capacity(MAX_LOG_ENTRIES),
-            deadline_violations: Vec::with_capacity(MAX_LOG_ENTRIES),
-            fault_log: Vec::with_capacity(MAX_LOG_ENTRIES),
-            safety_alerts: Vec::with_capacity(MAX_LOG_ENTRIES),
+            recovery_times: Vec::with_capacity(10),
+            dropped_log: Vec::with_capacity(LOG_MAX_SIZE),
+            deadline_log: Vec::with_capacity(LOG_MAX_SIZE),
+            fault_log: Vec::with_capacity(LOG_MAX_SIZE),
+            safety_alerts: Vec::with_capacity(LOG_MAX_SIZE),
  
-            total_received_readings: 0,
-            total_dropped_readings: 0,
-            consecutive_thermal_misses: 0,
-            active_time_milliseconds: 0,
-            elapsed_time_milliseconds: 0,
+            total_received: 0,
+            total_dropped: 0,
+            thermal_misses: 0,
+            active_time: 0,
+            elapsed_time: 0,
         }
     }
 }
  
  
-// =============================================================================
-//  BOUNDED PRIORITY BUFFER  (Lab 11 concept upgrade)
-// =============================================================================
- 
+// 5. ---- BOUNDED BUFFER ----
+// Bounded buffer with Priority for sensor readings
 struct PriorityBuffer
 {
-    heap: BinaryHeap<SensorReading>,  // max-heap with reversed ordering
+    heap: BinaryHeap<SensorReading>,  // already reflects priority
     capacity: usize,
 }
  
@@ -485,14 +404,14 @@ impl PriorityBuffer
 {
     fn new(capacity: usize) -> Self
     {
-        PriorityBuffer
+        PriorityBuffer // creates a new PriorityBuffer
         {
             heap: BinaryHeap::with_capacity(capacity),
             capacity,
         }
     }
  
-    // Push a reading. Returns false (drop) if buffer is at capacity.
+    // Push a reading, returns false (drop) if buffer is at capacity
     fn push(&mut self, reading: SensorReading) -> bool
     {
         if self.heap.len() >= self.capacity
@@ -504,122 +423,106 @@ impl PriorityBuffer
         true
     }
  
-    // Pop the highest-priority reading (lowest priority number wins)
+    // Pop the highest priority reading, in order to satisfy deadline
     fn pop(&mut self) -> Option<SensorReading>
     {
         self.heap.pop()
     }
  
-    // How full is the buffer? Used to transition to Degraded state.
+    // Calculates how full is the buffer, used to transition to Degraded state
     fn fill_ratio(&self) -> f32
     {
-        self.heap.len() as f32 / self.capacity as f32
+        self.heap.len() as f32 / self.capacity as f32      // calculates length / capacity
     }
 }
  
- 
-// =============================================================================
-//  HELPER FUNCTIONS
-// =============================================================================
- 
-// Shared Arc<Mutex<T>> alias to reduce signature noise
+
+// 6. ---- HELPER METHODS ----
+
+// 6.1 Creates a Shared Arc<Mutex<T>> as repeats many times, (Arc - Atomic Reference Count) = to allow multiple owners, Mutex = thread-safe
 type Shared<T> = Arc<Mutex<T>>;
+
+// 6.2 Converts an OCSMessage to a JSON string
+fn encode_message(message: &OCSMessage) -> String 
+{
+    serde_json::to_string(message).unwrap_or_default()
+} //XXX: to be removed
  
-// Returns simulation-relative time in milliseconds from simulation start
-fn simulation_elapsed_ms(simulation_start_time: &Instant) -> u64
+// 6.3 Returns current simulation time from start time
+fn simulation_elapsed(simulation_start_time: &Instant) -> u64
 {
     simulation_start_time.elapsed().as_millis() as u64
 }
  
-// Returns whether the system is still running
+// 6.4 Boolean helper to determine if system is running
 fn is_running(running: &Shared<bool>) -> bool
 {
     *running.lock().unwrap()
 }
  
-// Helper: serialise and send a typed OcsMessage through the UDP sender channel
-fn send_ocs_message(udp_sender: &mpsc::Sender<String>, message: OcsMessage)
+// 6.5 Serialise and send a typed OCSMessage through the UDP sender channel
+fn send_ocs_message(udp_sender: &mpsc::Sender<String>, message: OCSMessage)
 {
-    let encoded_message = encode_message(&message);
-    let _ = udp_sender.send(encoded_message);
+    let encoded_message = serde_json::to_string(message).unwrap_or_default();
+    let _ = udp_sender.send(encoded_message);  // _ = unused variable, following warning provided
 }
  
-// Helper: push a deadline violation into metrics
-fn log_deadline_violation(metrics: &Shared<SystemMetrics>, violation: String)
+// 6.6 Append deadline violation into metrics
+fn append_deadline(metrics: &Shared<SystemMetrics>, violation: String)
 {
-    metrics.lock().unwrap().deadline_violations.push(violation);
+    metrics.lock().unwrap().deadline_log.push(violation);
 }
  
-// Helper: get buffer fill ratio
-fn priority_buffer_fill_ratio(priority_buffer: &Shared<PriorityBuffer>) -> f32
+// 6.7 Calculate scheduling drift
+fn calculate_drift(simulation_start_time: &Instant, expected_elapsed: u64) -> i64
 {
-    priority_buffer.lock().unwrap().fill_ratio()
+    let actual_elapsed = simulation_elapsed(simulation_start_time);
+    actual_elapsed as i64 - expected_elapsed as i64
 }
  
-// Helper: calculate scheduling drift in ms
-//
-// IMPORTANT:
-// This now correctly uses simulation-relative time from the common simulation
-// start instant, rather than task-local elapsed time from each task's own
-// Instant. That gives a consistent timeline for the entire simulation.
-fn calculate_drift_milliseconds(
-    simulation_start_time: &Instant,
-    expected_elapsed_milliseconds: u64,
-) -> i64
+// 6.8 Push a sensor reading into the buffer and record metrics
+fn push_record_metrics(priority_buffer: &Shared<PriorityBuffer>, metrics: &Shared<SystemMetrics>, sensor_reading: SensorReading, drift: i64) -> (bool, u64)
 {
-    let actual_elapsed_milliseconds = simulation_elapsed_ms(simulation_start_time);
-    actual_elapsed_milliseconds as i64 - expected_elapsed_milliseconds as i64
-}
- 
-// Helper: push a sensor reading into the buffer and record common metrics
-fn push_reading_and_record_metrics(
-    priority_buffer: &Shared<PriorityBuffer>,
-    metrics: &Shared<SystemMetrics>,
-    sensor_reading: SensorReading,
-    drift_milliseconds: i64,
-) -> (bool, u64)
-{
-    // ── Lab 3: Measure buffer insert latency ──────────────────────────────
+    // Measure buffer insert latency
     let insert_start_time = Instant::now();
     let accepted = priority_buffer.lock().unwrap().push(sensor_reading);
-    let insert_latency_microseconds = insert_start_time.elapsed().as_micros() as u64;
+    let insert_latency = insert_start_time.elapsed().as_micros() as u64;
  
-    // ── Update shared metrics ─────────────────────────────────────────────
-    {
-        let mut metrics_guard = metrics.lock().unwrap();
-        metrics_guard.total_received_readings += 1;
-        metrics_guard.insert_latency_microseconds.push(insert_latency_microseconds);
-        metrics_guard.drift_milliseconds.push(drift_milliseconds);
+    {   // Update metrics
+        let mut metrics_lock = metrics.lock().unwrap();
+        metrics_lock.total_received += 1;
+        metrics_lock.insert_latency.push(insert_latency);
+        metrics_lock.drift.push(drift);
  
         if !accepted
         {
-            metrics_guard.total_dropped_readings += 1;
+            metrics_lock.total_dropped += 1;  // if didnt fit, dropped
         }
     }
  
-    (accepted, insert_latency_microseconds)
+    (accepted, insert_latency) // return tuple
 }
  
-// Helper: write a detailed runtime log line to the log file only
-fn write_runtime_log(runtime_logger: &Shared<File>, line: &str)
+// 6.9 Append log line to the log file only
+fn append_log(log: &Shared<File>, line: &str)
 {
-    let mut log_file = runtime_logger.lock().unwrap();
-    let _ = writeln!(log_file, "{line}");
+    let mut log_file = log.lock().unwrap();
+    let _ = writeln!(log_file, "{line}");  // _ needed to handle Result, handling warning
 }
  
-// Helper: print important events to terminal AND write them to the runtime log
-fn print_and_log_important(runtime_logger: &Shared<File>, line: &str)
+// 6.10 Append important log line to console and log file
+fn append_console_log(log: &Shared<File>, line: &str)
 {
     println!("{line}");
-    write_runtime_log(runtime_logger, line);
+    append_log(log, line);
 }
  
-// Pretty-print a single row in the metrics report table
-fn print_stat_row(label: &str, samples: &[i64])
+// 6.11 Print a single row in the metrics report table
+fn print_row(label: &str, samples: &[i64])
 {
     if samples.is_empty()
     {
-        println!("    {:<36} — no data", label);
+        println!("    {:<36} — no data", label); // < means left align
         return;
     }
  
@@ -627,544 +530,467 @@ fn print_stat_row(label: &str, samples: &[i64])
     let maximum_value = samples.iter().max().unwrap();
     let average_value = samples.iter().sum::<i64>() as f64 / samples.len() as f64;
  
-    println!(
-        "    {:<36} n={:>5}  min={:>7}  max={:>7}  avg={:>9.1}",
-        label,
-        samples.len(),
-        minimum_value,
-        maximum_value,
-        average_value
-    );
+    println!("    {:<36} n={:>5}  min={:>7}  max={:>7}  avg={:>9.1}", label, samples.len(), minimum_value, maximum_value, average_value);
 }
  
- 
-// =============================================================================
-//  LOG FILE INITIALISER
-//
-//  Creates/truncates the runtime log file at startup.
-//  Detailed runtime events are written here to keep the terminal readable.
-// =============================================================================
- 
-fn create_runtime_logger() -> Shared<File>
+
+// 7. ---- LOG FILE CREATION ----
+fn create_log() -> Shared<File>
 {
     let log_file = OpenOptions::new()
         .create(true)
         .write(true)
-        .truncate(true)
-        .open(RUNTIME_LOG_FILE)
-        .expect("[LOG] Failed to create runtime log file");
- 
-    Arc::new(Mutex::new(log_file))
+        .truncate(true) // clear the file
+        .open(LOG_FILE)
+        .expect("[LOG] Failed to create log file"); // handle error
+
+    Arc::new(Mutex::new(log_file)) // a shared reference is required
 }
  
  
-// =============================================================================
-//  UDP SENDER THREAD  (Lab 9: UdpSocket.send_to + Lab 11: mpsc consumer)
-// =============================================================================
- 
-fn udp_sender_thread(
-    udp_receiver: mpsc::Receiver<String>,
-    runtime_logger: Shared<File>,
-    simulation_start_time: Instant,
-)
+// 8. ---- UDP SENDER ----
+// Sends OCSMessage telemetry to GCS via UDP
+fn udp_sender_thread(udp_receiver: mpsc::Receiver<String>, log: Shared<File>, simulation_start_time: Instant)
 {
-    // Bind to any available local port — we only need to SEND, not receive
-    let socket = UdpSocket::bind("0.0.0.0:0").expect("[UDP-SEND] bind failed");
+    // Bind to any available local port for sending
+    let socket = UdpSocket::bind("0.0.0.0:0").expect("[OCS-UDP] bind failed");
  
-    println!(
-        "[OCS] Telemetry link established → {}",
+    println!("[OCS] Telemetry link established -> {}", GCS_TELEMETRY_ADDRESS);
+
+    let log_line = format!
+    (
+        "[{}ms] [OCS-UDP] Ready -> {}",
+        simulation_elapsed(&simulation_start_time),
         GCS_TELEMETRY_ADDRESS
-    );
-    write_runtime_log(
-        &runtime_logger,
-        &format!(
-            "[{}ms] [UDP-SEND] Ready → {}",
-            simulation_elapsed_ms(&simulation_start_time),
-            GCS_TELEMETRY_ADDRESS
-        ),
-    );
+    )
+    append_log(&log, &log_line);
  
-    // Lab 11: "for msg in rx" — the loop ends when all senders are dropped
+    // for msg in Receiver, the loop ends when all senders are dropped
     for message in &udp_receiver
     {
         socket.send_to(message.as_bytes(), GCS_TELEMETRY_ADDRESS)
-            .unwrap_or_else(|error|
+            .unwrap_or_else(|error|             // unwrap_or_else = if error
             {
-                let line = format!(
-                    "[OCS] [UDP-SEND] Connection error: {}",
+                let log_line = format!
+                (
+                    "[OCS-UDP] Connection error: {}",
                     error
                 );
-                print_and_log_important(&runtime_logger, &line);
-                0
+                append_console_log(&log, &log_line);
+                0           // 0 = exit
             });
     }
- 
-    print_and_log_important(
-        &runtime_logger,
-        &format!(
-            "[{}ms] [UDP-SEND] All senders dropped — exit.",
-            simulation_elapsed_ms(&simulation_start_time)
+    
+    append_console_log(&log, &format! 
+        (
+            "[{}ms] [OCS-UDP] All senders dropped — exit.",
+            simulation_elapsed(&simulation_start_time)
         ),
     );
 }
  
- 
-// =============================================================================
-//  COMMAND RECEIVER THREAD  (Lab 9: UdpSocket.recv_from + serde_json)
-// =============================================================================
- 
-fn command_receiver_thread(
-    running: Shared<bool>,
-    runtime_logger: Shared<File>,
-    simulation_start_time: Instant,
-)
+
+// 9. ---- UDP RECEIVER ----
+// Receives commands from the GCS and executes them
+fn command_receiver_thread(running: Shared<bool>, log: Shared<File>, simulation_start_time: Instant)
 {
-    let socket = UdpSocket::bind(OCS_COMMAND_BIND_ADDRESS).expect("[OCS-CMD] bind failed");
+    // Bind to the GCS command port
+    let socket = UdpSocket::bind(OCS_COMMAND_ADDRESS).expect("[OCS-UDP] bind failed");
+    socket.set_read_timeout(Some(Duration::from_millis(UDP_TIMEOUT))).unwrap(); // prevents recv_from from blocking forever,
+    
+    let log_line = format!
+    (
+        "[{}ms] [OCS-UDP] Listening on {}",
+        simulation_elapsed(&simulation_start_time),
+        OCS_COMMAND_ADDRESS
+    )
+    append_console_log(&log, &log_line);
  
-    // set_read_timeout prevents recv_from from blocking forever,
-    // allowing us to check the `running` flag each iteration.
-    socket.set_read_timeout(Some(Duration::from_millis(UDP_READ_TIMEOUT))).unwrap();
+    let mut receive_buffer = [0u8; 4096]; // buffer for incoming packets, 0u8 = unsigned 8-bit integer, 4096 bytes
  
-    print_and_log_important(
-        &runtime_logger,
-        &format!(
-            "[{}ms] [OCS-CMD] Listening on {}",
-            simulation_elapsed_ms(&simulation_start_time),
-            OCS_COMMAND_BIND_ADDRESS
-        ),
-    );
- 
-    let mut receive_buffer = [0u8; 4096];
- 
-    while is_running(&running)
+    while is_running(&running)            // timeout allows checking the `running` flag
     {
-        match socket.recv_from(&mut receive_buffer)
+        match socket.recv_from(&mut receive_buffer) // recv_from = receive from, 
         {
             Ok((received_length, source_address)) =>
             {
-                let raw_payload = String::from_utf8_lossy(&receive_buffer[..received_length]);
+                let payload = String::from_utf8_lossy(&receive_buffer[..received_length]);
  
-                // serde_json: deserialise the raw bytes into a typed GcsCommand struct
-                match serde_json::from_str::<GcsCommand>(&raw_payload)
+                // serde_json to deserialise the raw bytes into a typed GCSCommand struct
+                match serde_json::from_str::<GCSCommand>(&payload)
                 {
                     Ok(command) =>
                     {
-                        let line = format!(
-                            "[{}ms] [OCS-CMD] {} → cmd=\"{}\"  ts={}",
-                            simulation_elapsed_ms(&simulation_start_time),
+                        let line = format!
+                        (
+                            "[{}ms] [OCS-UDP] {} -> command=\"{}\"  timestamp={}",
+                            simulation_elapsed(&simulation_start_time),
                             source_address,
                             command.cmd,
                             command.ts
                         );
-                        write_runtime_log(&runtime_logger, &line);
+                        append_log(&log, &line);
                     }
                     Err(_) =>
                     {
                         let line = format!(
-                            "[{}ms] [OCS-CMD] {} (unparsed): {}",
-                            simulation_elapsed_ms(&simulation_start_time),
+                            "[{}ms] [OCS-UDP] {} (unparsed): {}",
+                            simulation_elapsed(&simulation_start_time),
                             source_address,
-                            raw_payload
+                            payload
                         );
-                        print_and_log_important(&runtime_logger, &line);
+                        append_console_log(&log, &line);     // as error
                     }
                 }
             }
- 
-            // WouldBlock / TimedOut are expected — just loop again
+            // If WouldBlock / TimedOut happens
             Err(error)
-                if error.kind() == std::io::ErrorKind::WouldBlock
-                || error.kind() == std::io::ErrorKind::TimedOut => {}
- 
+                if (error.kind() == std::io::ErrorKind::WouldBlock || error.kind() == std::io::ErrorKind::TimedOut) => 
+                {
+                    // Just loop again
+                }
+            // General error
             Err(error) =>
             {
-                let line = format!(
-                    "[{}ms] [OCS-CMD] {}",
-                    simulation_elapsed_ms(&simulation_start_time),
+                let line = format!
+                (
+                    "[{}ms] [OCS-UDP] {}",
+                    simulation_elapsed(&simulation_start_time),
                     error
                 );
-                print_and_log_important(&runtime_logger, &line);
+                append_console_log(&log, &line);
             }
         }
-    }
+    }       // Usage of Result<T, E> enum, sophisticated error handling for Hard RTS
  
-    print_and_log_important(
-        &runtime_logger,
-        &format!(
-            "[{}ms] [OCS-CMD] Exit.",
-            simulation_elapsed_ms(&simulation_start_time)
+    append_console_log(&log, &format!
+        (
+            "[{}ms] [OCS-UDP] Exit.",
+            simulation_elapsed(&simulation_start_time)
         ),
     );
 }
  
- 
-// =============================================================================
-//  PART 1 — SENSOR THREADS  (dedicated OS threads — Lab 2)
-// =============================================================================
- 
-fn thermal_sensor_thread(
-    priority_buffer: Shared<PriorityBuffer>,
-    metrics: Shared<SystemMetrics>,
-    state: Shared<SystemState>,
-    emergency: Shared<bool>,
-    udp_sender: mpsc::Sender<String>,
-    running: Shared<bool>,
-    runtime_logger: Shared<File>,
-    simulation_start_time: Instant,
-)
+// ~~~~ SECTION 1: Sensor Data Acquisition & Prioritization ~~~~~
+// 10. ---- THERMAL THREAD (CRITICAL SENSOR) ----
+fn thermal_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<SystemMetrics>, state: Shared<SystemState>, emergency: Shared<bool>, udp_sender: mpsc::Sender<String>, running: Shared<bool>, log: Shared<File>, simulation_start_time: Instant)
 {
-    write_runtime_log(
-        &runtime_logger,
-        &format!(
-            "[{}ms] [Thermal] period={}ms  buf_priority=1  SAFETY-CRITICAL",
-            simulation_elapsed_ms(&simulation_start_time),
-            THERMAL_SENSOR_PERIOD
-        ),
+    let log_line = format!
+    (
+        "[{}ms] [Thermal] period={}ms  buffer_priority=1  CRITICAL SENSOR",
+        simulation_elapsed(&simulation_start_time),
+        THERMAL_PERIOD
     );
- 
+    append_log(&log, &log_line);
+    
     let mut sequence_number: u64 = 0;
  
     while is_running(&running)
     {
-        thread::sleep(Duration::from_millis(THERMAL_SENSOR_PERIOD));
- 
-        let expected_elapsed_milliseconds = (sequence_number + 1) * THERMAL_SENSOR_PERIOD;
-        let drift_milliseconds = calculate_drift_milliseconds(
-            &simulation_start_time,
-            expected_elapsed_milliseconds,
-        );
+        // Slow down in degraded mode
+        let current_state = state.lock().unwrap().clone();
+        if current_state == SystemState::Degraded
+        {
+            thread::sleep(Duration::from_millis(THERMAL_PERIOD * 2));
+        }
+        else
+        {
+            thread::sleep(Duration::from_millis(THERMAL_PERIOD));
+        }
+        
+        // Calculate scheduling drift
+        let expected_elapsed = (sequence_number + 1) * THERMAL_PERIOD;
+        let drift = calculate_drift(&simulation_start_time, expected_elapsed);
  
         // Simulate a slowly rising temperature
-        let temperature_celsius: f64 = 22.0 + (sequence_number % 50) as f64 * 0.3;
+        let temperature: f64 = 22.0 + (sequence_number % 50) as f64 * 0.3; //XXX: FORMULA
  
         // Build the sensor reading with priority 1 (highest / most critical)
         let sensor_reading = SensorReading
         {
             sensor_type: SensorType::Thermal,
-            value: temperature_celsius,
-            timestamp_ms: simulation_elapsed_ms(&simulation_start_time),
+            value: temperature,
+            timestamp: simulation_elapsed(&simulation_start_time),
             priority: 1,
         };
- 
-        let (accepted, _insert_latency_microseconds) = push_reading_and_record_metrics(
-            &priority_buffer,
-            &metrics,
-            sensor_reading,
-            drift_milliseconds,
-        );
- 
+        
+        // Push the sensor reading to the buffer
+        let (accepted,) = push_record_metrics(&priority_buffer, &metrics, sensor_reading, drift);
         {
-            let mut metrics_guard = metrics.lock().unwrap();
+            let mut metrics_lock = metrics.lock().unwrap();
  
-            // Record jitter (skip seq=0 as there is no previous reference)
+            // Record jitter (skip first sequence as there is nothing to deduct from previous)
             if sequence_number > 0
             {
-                // Only jitter uses .as_micros() per your preference:
-                // derive expected vs actual timing with Duration, then convert ONLY here.
-                let jitter_microseconds = Duration::from_millis(drift_milliseconds.unsigned_abs())
-                    .as_micros() as i64;
+                // Jitter uses microseconds for precision
+                let jitter = Duration::from_millis(drift.unsigned_abs()).as_micros() as i64;
+                metrics_lock.thermal_jitter.push(jitter);
  
-                metrics_guard.thermal_jitter_microseconds.push(jitter_microseconds);
- 
-                if jitter_microseconds > JITTER_WARNING_LIMIT_MICROSECONDS
+                if jitter > THERMAL_JITTER_TIME_LIMIT
                 {
-                    let violation = format!(
-                        "[{}ms] [WARN] Thermal jitter {}µs  seq={}",
-                        simulation_elapsed_ms(&simulation_start_time),
-                        jitter_microseconds,
+                    let line = format!
+                    (
+                        "[{}ms] [WARN] Thermal jitter {}µs  sequence={}",
+                        simulation_elapsed(&simulation_start_time),
+                        jitter,
                         sequence_number
                     );
- 
-                    write_runtime_log(&runtime_logger, &violation);
-                    metrics_guard.deadline_violations.push(violation);
+                    append_log(&log, &line);
+                    metrics_lock.deadline_log.push(line);
                 }
             }
  
-            // ── Lab 7: Consecutive miss counter ────────────────────────────────
-            if accepted
+            // Check and act for 3 consecutive misses requirement
+            if (accepted)
             {
-                metrics_guard.consecutive_thermal_misses = 0;
+                metrics_lock.thermal_misses = 0;
             }
             else
             {
-                metrics_guard.consecutive_thermal_misses += 1;
+                metrics_lock.thermal_misses += 1;
  
-                let fill_ratio = priority_buffer_fill_ratio(&priority_buffer);
-                let drop_message = format!(
-                    "[{}ms] [DROP] Thermal seq={}  fill={:.1}%",
-                    simulation_elapsed_ms(&simulation_start_time),
+                let fill_ratio = priority_buffer.lock().unwrap().fill_ratio();
+                let line = format!
+                (
+                    "[{}ms] [DROP] Thermal sequence={}  fill={:.1}%", // .1 = 1 decimal place
+                    simulation_elapsed(&simulation_start_time),
                     sequence_number,
-                    fill_ratio * 100.0
+                    fill_ratio * 100.0      // also 1 decimal place
                 );
+                append_log(&log, &line);
+                metrics_lock.dropped_log.push(line);
  
-                write_runtime_log(&runtime_logger, &drop_message);
-                metrics_guard.dropped_log.push(drop_message);
- 
-                // Safety alert after MAX_CONSECUTIVE_THERMAL_MISSES consecutive drops
-                if metrics_guard.consecutive_thermal_misses >= MAX_CONSECUTIVE_THERMAL_MISSES
+                // Safety alert IF already 3 consecutive drops
+                if metrics_lock.thermal_misses >= THERMAL_MAX_MISSES
                 {
                     *emergency.lock().unwrap() = true;
  
-                    let alert_message = format!(
-                        "[{}ms] !!! SAFETY ALERT !!! {} thermal misses",
-                        simulation_elapsed_ms(&simulation_start_time),
-                        metrics_guard.consecutive_thermal_misses
+                    let line = format!
+                    (
+                        "[{}ms] !! SAFETY ALERT !! {} thermal misses",
+                        simulation_elapsed(&simulation_start_time),
+                        metrics_lock.thermal_misses
                     );
+                    append_console_log(&log, &line);
+                    metrics_lock.safety_alerts.push(line);
  
-                    print_and_log_important(&runtime_logger, &alert_message);
-                    metrics_guard.safety_alerts.push(alert_message);
- 
-                    // serde: send a typed alert to GCS
-                    send_ocs_message(
+                    // Send a typed alert to GCS, using serde
+                    send_ocs_message
+                    (
                         &udp_sender,
-                        OcsMessage::Alert
+                        OCSMessage::Alert 
                         {
                             event: "thermal_alert".into(),
-                            info: AlertInfo
-                            {
-                                misses: Some(metrics_guard.consecutive_thermal_misses),
-                                ..Default::default()
-                            },
+                            misses: Some(metrics_lock.thermal_misses as u32),
+                            count: None,            // Not applicable for this fault
+                            fault_type: None,       // TODO: Optional
                         }
                     );
                 }
             }
         }
- 
-        // Transition to Degraded if buffer is >= 80% full
-        if priority_buffer_fill_ratio(&priority_buffer) >= DEGRADED_MODE_THRESHOLD
-        {
-            let mut system_state = state.lock().unwrap();
- 
-            if *system_state == SystemState::Normal
-            {
-                let line = format!(
-                    "[{}ms] [Thermal] Buffer >= 80% → DEGRADED",
-                    simulation_elapsed_ms(&simulation_start_time)
-                );
- 
-                print_and_log_important(&runtime_logger, &line);
-                *system_state = SystemState::Degraded;
-            }
-        }
- 
-        // Send telemetry to GCS every 5 readings to avoid flooding
+
+        //XXX: purpose of command from gcs? change value
+        // Send telemetry to GCS every 5 readings as downlink is expensive
         if sequence_number % 5 == 0
         {
-            send_ocs_message(
+            send_ocs_message
+            (
                 &udp_sender,
-                OcsMessage::Thermal
+                OCSMessage::Thermal
                 {
-                    seq: sequence_number,
-                    temp: temperature_celsius,
-                    drift_ms: drift_milliseconds,
+                    sequence: sequence_number,
+                    temperature: temperature,
+                    drift: drift,
                 }
             );
         }
- 
         sequence_number += 1;
     }
  
-    print_and_log_important(
-        &runtime_logger,
-        &format!(
+    append_console_log(&log, &format!
+        (
             "[{}ms] [Thermal] Exit.",
-            simulation_elapsed_ms(&simulation_start_time)
+            simulation_elapsed(&simulation_start_time)
         ),
     );
 }
  
  
-fn accelerometer_thread(
-    priority_buffer: Shared<PriorityBuffer>,
-    metrics: Shared<SystemMetrics>,
-    udp_sender: mpsc::Sender<String>,
-    running: Shared<bool>,
-    runtime_logger: Shared<File>,
-    simulation_start_time: Instant,
-)
+// 11. ---- ACCELEROMETER THREAD ----
+fn accelerometer_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<SystemMetrics>, state: Shared<SystemState>, udp_sender: mpsc::Sender<String>, running: Shared<bool>, log: Shared<File>, simulation_start_time: Instant)
 {
-    write_runtime_log(
-        &runtime_logger,
-        &format!(
-            "[{}ms] [Accel] period={}ms  buf_priority=2",
-            simulation_elapsed_ms(&simulation_start_time),
-            ACCELEROMETER_PERIOD
-        ),
+    let log_line = format!
+    (
+        "[{}ms] [Accelerometer] period={}ms  buffer_priority=2",
+        simulation_elapsed(&simulation_start_time),
+        ACCELEROMETER_PERIOD
     );
- 
+    append_log(&log, &log_line);
+    
     let mut sequence_number: u64 = 0;
- 
+
     while is_running(&running)
     {
-        thread::sleep(Duration::from_millis(ACCELEROMETER_PERIOD));
- 
-        let expected_elapsed_milliseconds = (sequence_number + 1) * ACCELEROMETER_PERIOD;
-        let drift_milliseconds = calculate_drift_milliseconds(
-            &simulation_start_time,
-            expected_elapsed_milliseconds,
-        );
- 
-        // Simulate a 3-axis accelerometer reading
+        // Slow down in degraded mode
+        let current_state = state.lock().unwrap().clone();
+        if current_state == SystemState::Degraded
+        {
+            thread::sleep(Duration::from_millis(ACCELEROMETER_PERIOD * 2));
+        }
+        else
+        {
+            thread::sleep(Duration::from_millis(ACCELEROMETER_PERIOD));
+        }
+        
+        // Calculate scheduling drift
+        let expected_elapsed = (sequence_number + 1) * ACCELEROMETER_PERIOD;
+        let drift = calculate_drift(&simulation_start_time, expected_elapsed);
+
         let acceleration_x = (sequence_number as f64 * 0.05).sin() * 0.10;
         let acceleration_y = (sequence_number as f64 * 0.07).cos() * 0.10;
         let acceleration_z = 9.81 + (sequence_number as f64 * 0.03).sin() * 0.01;
-        let magnitude = (acceleration_x * acceleration_x
-            + acceleration_y * acceleration_y
-            + acceleration_z * acceleration_z).sqrt();
- 
+        let magnitude = (acceleration_x * acceleration_x + acceleration_y * acceleration_y + acceleration_z * acceleration_z).sqrt(); //XXX: FORMULA
+
+        // Build the sensor reading with priority 2
         let sensor_reading = SensorReading
         {
             sensor_type: SensorType::Accelerometer,
             value: magnitude,
-            timestamp_ms: simulation_elapsed_ms(&simulation_start_time),
+            timestamp: simulation_elapsed(&simulation_start_time),
             priority: 2,
         };
- 
-        let (accepted, _insert_latency_microseconds) = push_reading_and_record_metrics(
-            &priority_buffer,
-            &metrics,
-            sensor_reading,
-            drift_milliseconds,
-        );
- 
+        
+        // Push the sensor reading to the buffer
+        let (accepted,) = push_record_metrics(&priority_buffer, &metrics, sensor_reading, drift);
         {
-            let mut metrics_guard = metrics.lock().unwrap();
- 
+            let mut metrics_lock = metrics.lock().unwrap();
+
+            // Record jitter (skip first sequence as there is nothing to deduct from previous)
             if sequence_number > 0
             {
-                let jitter_microseconds = Duration::from_millis(drift_milliseconds.unsigned_abs())
-                    .as_micros() as i64;
- 
-                metrics_guard.accelerometer_jitter_microseconds.push(jitter_microseconds);
+                let jitter = Duration::from_millis(drift.unsigned_abs()).as_micros() as i64;
+                metrics_lock.accelerometer_jitter.push(jitter);
             }
- 
-            if !accepted
+
+            // Log if dropped
+            if !(accepted)
             {
-                let drop_message = format!(
-                    "[{}ms] [DROP] Accel seq={}",
-                    simulation_elapsed_ms(&simulation_start_time),
+                let line = format!
+                (
+                    "[{}ms] [DROP] Accelerometer sequence={}",
+                    simulation_elapsed(&simulation_start_time),
                     sequence_number
                 );
- 
-                write_runtime_log(&runtime_logger, &drop_message);
-                metrics_guard.dropped_log.push(drop_message);
+                append_log(&log, &line);
+                metrics_lock.dropped_log.push(line);
             }
-        }
- 
-        // Send telemetry every 10 readings
+        }   
+
+        // Send telemetry to GCS every 10 readings
         if sequence_number % 10 == 0
         {
-            send_ocs_message(
+            send_ocs_message
+            (
                 &udp_sender,
-                OcsMessage::Accel
+                OCSMessage::Accelerometer
                 {
-                    seq: sequence_number,
-                    mag: magnitude,
+                    sequence: sequence_number,
+                    velocity: magnitude,
+                    drift: drift,
                 }
             );
         }
- 
+
         sequence_number += 1;
     }
- 
-    print_and_log_important(
-        &runtime_logger,
-        &format!(
-            "[{}ms] [Accel] Exit.",
-            simulation_elapsed_ms(&simulation_start_time)
+
+    append_console_log(&log, &format!
+        (
+            "[{}ms] [Accelerometer] Exit.",
+            simulation_elapsed(&simulation_start_time)
         ),
     );
 }
- 
- 
-// =============================================================================
-//  GYROSCOPE SENSOR THREAD
-//
-//  Lowest-priority sensor (priority 3), 333ms period.
-//  Measures drift and jitter the same way as thermal and accelerometer.
-// =============================================================================
 
-fn gyroscope_thread(
-    priority_buffer: Shared<PriorityBuffer>,
-    metrics: Shared<SystemMetrics>,
-    udp_sender: mpsc::Sender<String>,
-    running: Shared<bool>,
-    runtime_logger: Shared<File>,
-    simulation_start_time: Instant,
-)
+ 
+// 12. ---- GYROSCOPE THREAD ----
+fn gyroscope_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<SystemMetrics>, state: Shared<SystemState>, udp_sender: mpsc::Sender<String>, running: Shared<bool>, log: Shared<File>, simulation_start_time: Instant)
 {
-    write_runtime_log(
-        &runtime_logger,
-        &format!(
-            "[{}ms] [Gyro] period={}ms  buf_priority=3",
-            simulation_elapsed_ms(&simulation_start_time),
-            GYROSCOPE_PERIOD
-        ),
+    let log_line = format!
+    (
+        "[{}ms] [Gyroscope] period={}ms  buffer_priority=3",
+        simulation_elapsed(&simulation_start_time),
+        GYROSCOPE_PERIOD
     );
-
+    append_log(&log, &log_line);
+    
     let mut sequence_number: u64 = 0;
 
     while is_running(&running)
     {
-        thread::sleep(Duration::from_millis(GYROSCOPE_PERIOD));
+        // Slow down in degraded mode
+        let current_state = state.lock().unwrap().clone();
+        if current_state == SystemState::Degraded
+        {
+            thread::sleep(Duration::from_millis(GYROSCOPE_PERIOD * 2));
+        }
+        else
+        {
+            thread::sleep(Duration::from_millis(GYROSCOPE_PERIOD));
+        }
+        
+        // Calculate scheduling drift
+        let expected_elapsed = (sequence_number + 1) * GYROSCOPE_PERIOD;
+        let drift = calculate_drift(&simulation_start_time, expected_elapsed);
+        let orientation: f64 = 0.5 * (sequence_number as f64 * 0.10).sin(); //XXX: FORMULA
 
-        let expected_elapsed_milliseconds = (sequence_number + 1) * GYROSCOPE_PERIOD;
-        let drift_milliseconds = calculate_drift_milliseconds(
-            &simulation_start_time,
-            expected_elapsed_milliseconds,
-        );
-
-        let angular_velocity_z: f64 = 0.5 * (sequence_number as f64 * 0.10).sin();
-
+        // Build the sensor reading with priority 3 (lowest priority)
         let sensor_reading = SensorReading
         {
             sensor_type: SensorType::Gyroscope,
-            value: angular_velocity_z,
-            timestamp_ms: simulation_elapsed_ms(&simulation_start_time),
+            value: orientation,
+            timestamp: simulation_elapsed(&simulation_start_time),
             priority: 3,
         };
-
-        let (accepted, _insert_latency_microseconds) = push_reading_and_record_metrics(
-            &priority_buffer,
-            &metrics,
-            sensor_reading,
-            drift_milliseconds,
-        );
-
+        
+        // Push the sensor reading to the buffer
+        let (accepted,) = push_record_metrics(&priority_buffer, &metrics, sensor_reading, drift);
         {
-            let mut metrics_guard = metrics.lock().unwrap();
+            let mut metrics_lock = metrics.lock().unwrap();
 
+            // Record jitter (skip first sequence as there is nothing to deduct from previous)
             if sequence_number > 0
             {
-                let jitter_microseconds = Duration::from_millis(drift_milliseconds.unsigned_abs())
-                    .as_micros() as i64;
-
-                metrics_guard.gyroscope_jitter_microseconds.push(jitter_microseconds);
+                let jitter = Duration::from_millis(drift.unsigned_abs()).as_micros() as i64;
+                metrics_lock.gyroscope_jitter.push(jitter);
             }
 
-            if !accepted
+            // Log if dropped
+            if !(accepted)
             {
-                let drop_message = format!(
-                    "[{}ms] [DROP] Gyro seq={}",
-                    simulation_elapsed_ms(&simulation_start_time),
+                let line = format!
+                (
+                    "[{}ms] [DROP] Gyroscope sequence={}",
+                    simulation_elapsed(&simulation_start_time),
                     sequence_number
                 );
-
-                write_runtime_log(&runtime_logger, &drop_message);
-                metrics_guard.dropped_log.push(drop_message);
+                append_log(&log, &line);
+                metrics_lock.dropped_log.push(line);
             }
         }
 
-        // Send telemetry every 25 readings
+        // Send telemetry to GCS every 10 readings
         if sequence_number % 25 == 0
         {
-            send_ocs_message(
+            send_ocs_message
+            (
                 &udp_sender,
-                OcsMessage::Gyro
+                OCSMessage::Gyroscope
                 {
-                    seq: sequence_number,
-                    omega_z: angular_velocity_z,
+                    sequence: sequence_number,
+                    orientation: orientation,
+                    drift: drift,
                 }
             );
         }
@@ -1172,907 +998,783 @@ fn gyroscope_thread(
         sequence_number += 1;
     }
 
-    print_and_log_important(
-        &runtime_logger,
-        &format!(
-            "[{}ms] [Gyro] Exit.",
-            simulation_elapsed_ms(&simulation_start_time)
+    append_console_log(&log, &format!
+        (
+            "[{}ms] [Gyroscope] Exit.",
+            simulation_elapsed(&simulation_start_time)
         ),
     );
 }
 
 
-// =============================================================================
-//  PART 2 — RM BACKGROUND TASKS via ScheduledThreadPool  (Lab 11)
-// =============================================================================
- 
-// ── Health Monitor (RM P1) ────────────────────────────────────────────────────
-// Reports buffer fill, system state, and drift every 200ms.
-// Sends OcsMessage::Status telemetry to GCS via UDP.
-fn make_health_monitor_task(
-    priority_buffer: Shared<PriorityBuffer>,
-    metrics: Shared<SystemMetrics>,
-    state: Shared<SystemState>,
-    udp_sender: mpsc::Sender<String>,
-    running: Shared<bool>,
-    runtime_logger: Shared<File>,
-    simulation_start_time: Instant,
-) -> impl FnMut() + Send + 'static
+// ~~~~ SECTION 2: Real-Time Task Scheduling  ~~~~~
+// 13. ---- HEALTH MONITOR THREAD (Rate Monotonic P1) ----
+// Reports buffer fill, system state, and drift every 200ms, sending OCSMessage::Status
+fn health_monitor_task(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<SystemMetrics>, state: Shared<SystemState>, udp_sender: mpsc::Sender<String>, running: Shared<bool>, log: Shared<File>, simulation_start_time: Instant) -> impl FnMut() + Send + 'static
 {
     let mut iteration: u64 = 0;
- 
+    
     move ||
     {
+        // If not running, return
         if !is_running(&running)
         {
             return;
         }
- 
         let active_work_start_time = Instant::now();
  
-        // Drift = how late is this task compared to its expected schedule
-        let expected_elapsed_milliseconds = iteration * HEALTH_MONITOR_PERIOD;
-        let drift_milliseconds = calculate_drift_milliseconds(
-            &simulation_start_time,
-            expected_elapsed_milliseconds,
-        );
- 
+        // Calculate scheduling drift
+        let expected_elapsed = iteration * HEALTH_MONITOR_PERIOD;
+        let drift = calculate_drift(&simulation_start_time,expected_elapsed,);
+        
+        // Get buffer state
         let (fill_ratio, buffer_length) =
         {
-            let buffer_guard = priority_buffer.lock().unwrap();
-            (buffer_guard.fill_ratio(), buffer_guard.heap.len())
+            let buffer_lock = priority_buffer.lock().unwrap();
+            (buffer_lock.fill_ratio(), buffer_lock.heap.len())
         };
- 
+        // Get system state
         let system_state = state.lock().unwrap().clone();
  
-        let detail_line = format!(
-            "[{}ms] [Health] iter={:>4}  buf={}/{} ({:.1}%)  state={:?}  drift={:+}ms",
-            simulation_elapsed_ms(&simulation_start_time),
+        let log_line = format!
+        (
+            "[{}ms] [Health] iteration={:>4}  buffer={}/{} ({:.1}%)  state={:?}  drift={:+}ms",
+            simulation_elapsed(&simulation_start_time),
             iteration,
             buffer_length,
-            PRIORITY_BUFFER_CAPACITY,
+            PRIORITY_BUFFER,
             fill_ratio * 100.0,
             system_state,
-            drift_milliseconds
+            drift
         );
-        write_runtime_log(&runtime_logger, &detail_line);
+        append_log(&log, &log_line);
  
-        // Flag if health task itself is drifting (deadline violation)
-        if drift_milliseconds.abs() > 5
+        // Flag if health task itself is drifting (deadline)
+        if drift.abs() > 5  // abs = absolute because drift is +ve or -ve, 5ms is deadline
         {
-            let violation = format!(
-                "[{}ms] [DEADLINE] Health drift={:+}ms iter={}",
-                simulation_elapsed_ms(&simulation_start_time),
-                drift_milliseconds,
+            let violation = format!
+            (
+                "[{}ms] [DEADLINE] Health drift={:+}ms iteration={}",
+                simulation_elapsed(&simulation_start_time),
+                drift,
                 iteration
             );
  
-            write_runtime_log(&runtime_logger, &violation);
-            log_deadline_violation(&metrics, violation);
+            append_log(&log, &violation);
+            append_deadline(&metrics, violation);
         }
  
-        // serde: send status telemetry to GCS
-        send_ocs_message(
+        // Send telemetry to GCS
+        send_ocs_message
+        (
             &udp_sender,
-            OcsMessage::Status
+            OCSMessage::Status
             {
-                iter: iteration,
+                iteration: iteration,
                 fill: fill_ratio as f64 * 100.0,
-                state: format!("{system_state:?}"),
-                drift_ms: drift_milliseconds,
+                state: format!("{system_state:?}"), // ? = enum to string
+                drift: drift,
             }
         );
  
-        let active_work_duration_ms = active_work_start_time.elapsed().as_millis() as u64;
- 
-        {
-            let mut metrics_guard = metrics.lock().unwrap();
-            metrics_guard.drift_milliseconds.push(drift_milliseconds);
-            metrics_guard.active_time_milliseconds += active_work_duration_ms;
-            metrics_guard.elapsed_time_milliseconds = simulation_elapsed_ms(&simulation_start_time);
+        let active_work_duration = active_work_start_time.elapsed().as_millis() as u64;
+        {   // Update metrics
+            let mut metrics_lock = metrics.lock().unwrap();
+            metrics_lock.drift.push(drift);
+            metrics_lock.active_time += active_work_duration;
+            metrics_lock.elapsed_time = simulation_elapsed(&simulation_start_time);
         }
  
         iteration += 1;
     }
 }
  
-// ── Data Compression Task (RM P2) ─────────────────────────────────────────────
-// Drains up to 20 readings from the priority buffer, "compresses" them
-// (simulated as 50% size reduction), and enqueues a DataPacket for downlink.
-fn make_data_compression_task(
-    priority_buffer: Shared<PriorityBuffer>,
-    downlink_queue: Shared<Vec<DataPacket>>,
-    metrics: Shared<SystemMetrics>,
-    running: Shared<bool>,
-    runtime_logger: Shared<File>,
-    simulation_start_time: Instant,
-) -> impl FnMut() + Send + 'static
+//XXX: overdo?
+// 14. ---- DATA COMPRESSION THREAD (Rate Monotonic P2) ----
+// Drains up to 20 readings from the priority buffer, compresses with 50% size reduction, enqueues a DataPacket for downlink
+fn data_compression_task(priority_buffer: Shared<PriorityBuffer>, downlink_queue: Shared<Vec<DataPacket>>, metrics: Shared<SystemMetrics>, running: Shared<bool>, log: Shared<File>, simulation_start_time: Instant) -> impl FnMut() + Send + 'static
 {
-    let mut packet_id: u64 = 0;
+    let mut packetID: u64 = 0;
     let mut iteration: u64 = 0;
  
     move ||
     {
+        // If not running, return
         if !is_running(&running)
         {
             return;
         }
- 
         let active_work_start_time = Instant::now();
  
-        let expected_elapsed_milliseconds = iteration * DATA_COMPRESSION_PERIOD;
-        let drift_milliseconds = calculate_drift_milliseconds(
-            &simulation_start_time,
-            expected_elapsed_milliseconds,
-        );
+        // Calculate scheduling drift
+        let expected_elapsed = iteration * DATA_COMPRESSION_PERIOD;
+        let drift = calculate_drift(&simulation_start_time, expected_elapsed);
  
-        // ── Lab 11: drain up to 20 items with .pop() (priority order) ─────────
+        // Drain up to 20 items with .pop()
         let mut sensor_batch: Vec<SensorReading> = Vec::new();
         {
-            let mut buffer_guard = priority_buffer.lock().unwrap();
+            let mut buffer_lock = priority_buffer.lock().unwrap();
  
-            for _ in 0..20
+            for i in 0..20
             {
-                match buffer_guard.pop()
+                match buffer_lock.pop()
                 {
-                    Some(sensor_reading) => sensor_batch.push(sensor_reading),
-                    None => break,
+                    Some(sensor_reading) => sensor_batch.push(sensor_reading),  // push to new batch
+                    None => break,      // if buffer is now empty, break
                 }
             }
         }
  
         if !sensor_batch.is_empty()
         {
-            // serde_json::json! macro builds a structured batch payload
+            // Build batch payload with serde_json
             let data_array: Vec<serde_json::Value> = sensor_batch.iter()
-                .map(|sensor_reading| serde_json::json!(
-                {
-                    "sensor": format!("{:?}", sensor_reading.sensor_type),
+                .map(|sensor_reading| serde_json::json!     // maps sensor_reading to json
+                ({
+                    "sensor": format!("{:?}", sensor_reading.sensor_type), // ? = enum to string
                     "value": sensor_reading.value,
-                    "timestamp_ms": sensor_reading.timestamp_ms,
+                    "timestamp": sensor_reading.timestamp,
                 }))
-                .collect();
+                .collect();  // collect into array
  
-            let raw_payload = serde_json::json!(
-            {
-                "packet_id": packet_id,
+            let payload = serde_json::json! // previous maps array to json
+            ({
+                "packetID": packetID,
                 "reading_count": sensor_batch.len(),
-                "created_at_ms": simulation_elapsed_ms(&simulation_start_time),
+                "created_at": simulation_elapsed(&simulation_start_time),
                 "data": data_array,
             }).to_string();
  
-            // Simulate ~50% compression ratio
-            let compressed_size_bytes = (raw_payload.len() / 2).max(1);
+            // Simulated 50% compression ratio, rounding down to at least 1 byte 
+            let compressed_size_bytes = (payload.len() / 2).max(1);
  
-            // Lab 3: measure queue insert latency
+            // Measure queue insert latency, push to downlink queue
             let queue_insert_start_time = Instant::now();
- 
             downlink_queue.lock().unwrap().push(DataPacket
             {
-                packet_id,
-                payload: raw_payload,
-                created_at_ms: simulation_elapsed_ms(&simulation_start_time),
+                packetID,
+                payload: payload,
+                created_at: simulation_elapsed(&simulation_start_time),
                 size_bytes: compressed_size_bytes,
             });
- 
-            let queue_insert_latency_microseconds = queue_insert_start_time.elapsed().as_micros() as u64;
- 
-            let detail_line = format!(
-                "[{}ms] [Compress] packet={}  n={}  {}B  q_insert={}µs  drift={:+}ms",
-                simulation_elapsed_ms(&simulation_start_time),
-                packet_id,
+            
+            // Calculate queue insert latency and log
+            let queue_insert_latency = queue_insert_start_time.elapsed().as_micros() as u64;
+            let line = format!
+            (
+                "[{}ms] [OCS-Compress] packet={}  n={}  {}bytes   queue_insert latency={}µs  drift={:+}ms",
+                simulation_elapsed(&simulation_start_time),
+                packetID,
                 sensor_batch.len(),
                 compressed_size_bytes,
-                queue_insert_latency_microseconds,
-                drift_milliseconds
+                queue_insert_latency,
+                drift
             );
-            write_runtime_log(&runtime_logger, &detail_line);
+            append_log(&log, &line);
  
-            packet_id += 1;
+            packetID += 1;
         }
  
-        if drift_milliseconds.abs() > 10
+        if drift.abs() > 10 // 10 ms deadline check
         {
-            let violation = format!(
-                "[{}ms] [DEADLINE] Compress drift={:+}ms iter={}",
-                simulation_elapsed_ms(&simulation_start_time),
-                drift_milliseconds,
+            let violation = format!
+            (
+                "[{}ms] [DEADLINE] Compress drift={:+}ms iteration={}",
+                simulation_elapsed(&simulation_start_time),
+                drift,
                 iteration
             );
  
-            write_runtime_log(&runtime_logger, &violation);
-            log_deadline_violation(&metrics, violation);
+            append_log(&log, &violation);
+            append_deadline(&metrics, violation);
         }
  
-        {
-            let mut metrics_guard = metrics.lock().unwrap();
-            metrics_guard.drift_milliseconds.push(drift_milliseconds);
-            metrics_guard.active_time_milliseconds += active_work_start_time.elapsed().as_millis() as u64;
+        {   // Update metrics
+            let mut metrics_lock = metrics.lock().unwrap();
+            metrics_lock.drift.push(drift);
+            metrics_lock.active_time += active_work_start_time.elapsed().as_millis() as u64;
         }
  
         iteration += 1;
     }
 }
- 
-// ── Antenna Alignment Task (RM P3) ────────────────────────────────────────────
-// Lowest priority RM task. Can be preempted (skipped) when emergency=true
-// or system is in MissionAbort state — demonstrating priority-based preemption.
-fn make_antenna_alignment_task(
-    metrics: Shared<SystemMetrics>,
-    state: Shared<SystemState>,
-    emergency: Shared<bool>,
-    running: Shared<bool>,
-    runtime_logger: Shared<File>,
-    simulation_start_time: Instant,
-) -> impl FnMut() + Send + 'static
+
+
+// 15. ---- ANTENNA ALIGNMENT THREAD (Rate Monotonic P3) ----
+// Lowest priority RM task, therefore can be preempted (skipped) when:
+// emergency=true OR system is in MissionAbort state — demonstrating priority-based preemption
+fn antenna_alignment_task(metrics: Shared<SystemMetrics>, state: Shared<SystemState>, emergency: Shared<bool>, running: Shared<bool>, log: Shared<File>, simulation_start_time: Instant) -> impl FnMut() + Send + 'static
 {
     let mut iteration: u64 = 0;
  
     move ||
     {
+        // If not running, return
         if !is_running(&running)
         {
             return;
         }
  
-        // ── Preemption check: skip if emergency or abort ───────────────────────
-        if *emergency.lock().unwrap() || *state.lock().unwrap() == SystemState::MissionAbort
+        // Preemption check: skip if emergency or abort
+        if (*emergency.lock().unwrap() || *state.lock().unwrap() == SystemState::MissionAbort)
         {
-            let line = format!(
-                "[{}ms] [Antenna] iter={:>4}  PREEMPTED",
-                simulation_elapsed_ms(&simulation_start_time),
+            // Append to console, log and deadline (metrics)
+            let log_line = format!
+            (
+                "[{}ms] [Antenna] iteration={:>4}  PREEMPTED",
+                simulation_elapsed(&simulation_start_time),
                 iteration
             );
+            append_console_log(&log, &log_line);
  
-            print_and_log_important(&runtime_logger, &line);
- 
-            let violation = format!(
-                "[{}ms] [PREEMPT] Antenna iter={}",
-                simulation_elapsed_ms(&simulation_start_time),
+            let violation = format!
+            (
+                "[{}ms] [PREEMPT] Antenna iteration={}",
+                simulation_elapsed(&simulation_start_time),
                 iteration
             );
-            log_deadline_violation(&metrics, violation);
+            append_deadline(&metrics, violation);
  
             iteration += 1;
             return;
         }
  
+        // Compute scheduling drift
         let active_work_start_time = Instant::now();
+        let expected_elapsed = iteration * ANTENNA_ALIGNMENT_PERIOD;
+        let drift = calculate_drift(&simulation_start_time, expected_elapsed);
  
-        let expected_elapsed_milliseconds = iteration * ANTENNA_ALIGNMENT_PERIOD;
-        let drift_milliseconds = calculate_drift_milliseconds(
-            &simulation_start_time,
-            expected_elapsed_milliseconds,
-        );
- 
-        // Compute azimuth and elevation for this iteration
-        let azimuth_degrees = (iteration as f64 * 7.2) % 360.0;
+        // Compute angle and elevation for this iteration
+        let angle_degrees = (iteration as f64 * 7.2) % 360.0; //XXX: FORMULA
         let elevation_degrees = 30.0 + 20.0 * (iteration as f64 * 0.05).sin();
  
-        let detail_line = format!(
-            "[{}ms] [Antenna] iter={:>4}  az={:>6.1}deg  el={:>5.1}deg  drift={:+}ms",
-            simulation_elapsed_ms(&simulation_start_time),
+        let line = format!
+        (
+            "[{}ms] [Antenna] iteration={:>4}  angle={:>6.1}degrees  elevation={:>5.1}degrees  drift={:+}ms",
+            simulation_elapsed(&simulation_start_time),
             iteration,
-            azimuth_degrees,
+            angle_degrees,
             elevation_degrees,
-            drift_milliseconds
+            drift
         );
-        write_runtime_log(&runtime_logger, &detail_line);
+        append_log(&log, &line);
  
-        if drift_milliseconds.abs() > 20
+        if drift.abs() > 20 // 20 ms deadline check
         {
-            let violation = format!(
-                "[{}ms] [DEADLINE] Antenna drift={:+}ms iter={}",
-                simulation_elapsed_ms(&simulation_start_time),
-                drift_milliseconds,
+            let violation = format!
+            (
+                "[{}ms] [DEADLINE] Antenna drift={:+}ms iteration={}",  //TODO: + means
+                simulation_elapsed(&simulation_start_time),
+                drift,
                 iteration
             );
  
-            write_runtime_log(&runtime_logger, &violation);
-            log_deadline_violation(&metrics, violation);
+            append_log(&log, &violation);
+            append_deadline(&metrics, violation);
         }
  
-        {
-            let mut metrics_guard = metrics.lock().unwrap();
-            metrics_guard.drift_milliseconds.push(drift_milliseconds);
-            metrics_guard.active_time_milliseconds += active_work_start_time.elapsed().as_millis() as u64;
+        {   // Update metrics
+            let mut metrics_lock = metrics.lock().unwrap();
+            metrics_lock.drift.push(drift);
+            metrics_lock.active_time += active_work_start_time.elapsed().as_millis() as u64;
         }
  
         iteration += 1;
     }
 }
  
- 
-// =============================================================================
-//  PART 3 — DOWNLINK THREAD  (Radio typestate from Lab 7)
-// =============================================================================
- 
-fn downlink_thread(
-    downlink_queue: Shared<Vec<DataPacket>>,
-    metrics: Shared<SystemMetrics>,
-    state: Shared<SystemState>,
-    udp_sender: mpsc::Sender<String>,
-    running: Shared<bool>,
-    runtime_logger: Shared<File>,
-    simulation_start_time: Instant,
-)
+
+// ~~~~ SECTION 3: Downlink Data Management ~~~~~
+// 16. ---- DOWNLINK THREAD ----
+fn downlink_thread(downlink_queue: Shared<Vec<DataPacket>>, metrics: Shared<SystemMetrics>, state: Shared<SystemState>, udp_sender: mpsc::Sender<String>, running: Shared<bool>, log: Shared<File>, simulation_start_time: Instant) 
 {
-    write_runtime_log(
-        &runtime_logger,
-        &format!(
-            "[{}ms] [Downlink] visibility={}s  window={}ms  (Radio typestate active)",
-            simulation_elapsed_ms(&simulation_start_time),
-            VISIBILITY_WINDOW_INTERVAL,
-            DOWNLINK_WINDOW_DURATION
-        ),
+    let log_line = format!
+    (
+        "[{}ms] [Downlink] visibility={}s  window={}ms  (Typestate Active)",
+        simulation_elapsed(&simulation_start_time),
+        VISIBILITY_PERIOD,
+        DOWNLINK_TIME_LIMIT
     );
- 
+    append_log(&log, &log_line);
+    
+
     while is_running(&running)
     {
         // Wait for next visibility window
-        thread::sleep(Duration::from_secs(VISIBILITY_WINDOW_INTERVAL));
- 
+        thread::sleep(Duration::from_millis(VISIBILITY_PERIOD));
         if !is_running(&running)
         {
             break;
         }
  
-        let visibility_line = format!(
-            "[{}ms] [Downlink] === Visibility window ===",
-            simulation_elapsed_ms(&simulation_start_time)
+        let line = format!
+        (
+            "[{}ms] [Downlink] ~~~ Visibility Window ~~~",
+            simulation_elapsed(&simulation_start_time)
         );
-        write_runtime_log(&runtime_logger, &visibility_line);
+        append_log(&log, &line);
  
-        // Check if the downlink queue is overflowing → Degraded
-        let queue_fill_ratio = downlink_queue.lock().unwrap().len() as f32 / PRIORITY_BUFFER_CAPACITY as f32;
- 
-        if queue_fill_ratio >= DEGRADED_MODE_THRESHOLD
+        // Check if the downlink queue is overflowing -> Degraded
+        let queue_fill_ratio = downlink_queue.lock().unwrap().len() as f32 / PRIORITY_BUFFER as f32;
+        // FIXME: move to health? why here
+        if queue_fill_ratio >= DEGRADED_MODE
         {
             let mut system_state = state.lock().unwrap();
  
             if *system_state == SystemState::Normal
             {
-                let line = format!(
+                let line = format!
+                (
                     "[{}ms] [Downlink] Queue >= 80% → DEGRADED",
-                    simulation_elapsed_ms(&simulation_start_time)
+                    simulation_elapsed(&simulation_start_time)
                 );
  
-                write_runtime_log(&runtime_logger, &line);
+                append_log(&log, &line);
                 *system_state = SystemState::Degraded;
             }
         }
  
-        // ── Lab 7: Typestate transition — Radio<Idle> → Radio<Transmitting> ───
+        // Typestate transition = Radio<Idle> -> Radio<Transmitting>
         let radio = Radio::<Idle>::new();
  
-        match radio.initialise(&simulation_start_time, &runtime_logger)
+        match radio.initialise(&simulation_start_time, &log)
         {
             None =>
             {
                 // Initialisation failed (exceeded 5ms deadline)
                 let violation = format!(
                     "[{}ms] [DEADLINE] Radio initialisation exceeded {}ms",
-                    simulation_elapsed_ms(&simulation_start_time),
-                    DOWNLINK_INITIALISATION_DEADLINE
+                    simulation_elapsed(&simulation_start_time),
+                    INITIALISE_TIME_LIMIT
                 );
- 
-                write_runtime_log(&runtime_logger, &violation);
-                log_deadline_violation(&metrics, violation);
+                append_log(&log, &violation);
+                append_deadline(&metrics, violation);
             }
  
             Some(transmitting_radio) =>
             {
                 // Drain all queued packets for transmission
-                let queued_packets: Vec<DataPacket> = downlink_queue.lock().unwrap().drain(..).collect();
- 
+                let queued_packets: Vec<DataPacket> = downlink_queue.lock().unwrap().drain(..).collect(); // .. = all elements
+                //XXX: overdone
                 if queued_packets.is_empty()
                 {
-                    let line = format!(
+                    let line = format!
+                    (
                         "[{}ms] [Downlink] Nothing queued.",
-                        simulation_elapsed_ms(&simulation_start_time)
+                        simulation_elapsed(&simulation_start_time)
                     );
  
-                    write_runtime_log(&runtime_logger, &line);
+                    append_log(&log, &line);
                 }
  
-                // transmit() consumes Radio<Transmitting> and returns Radio<Idle>
-                let _idle_radio = transmitting_radio.transmit(
-                    &queued_packets,
-                    &metrics,
-                    &udp_sender,
-                    &simulation_start_time,
-                    &runtime_logger,
-                );
+                // transmit() changes Radio<Transmitting> and returns Radio<Idle>
+                let _ = transmitting_radio.transmit(&queued_packets, &metrics, &udp_sender, &simulation_start_time, &log);
             }
         }
     }
  
-    print_and_log_important(
-        &runtime_logger,
-        &format!(
+    append_console_log(&log,&format!
+        (
             "[{}ms] [Downlink] Exit.",
-            simulation_elapsed_ms(&simulation_start_time)
+            simulation_elapsed(&simulation_start_time)
         ),
     );
 }
  
- 
-// =============================================================================
-//  PART 4 — FAULT INJECTOR  (Lab 7: enum FaultType + Lab 3: recovery timing)
-// =============================================================================
- 
-fn fault_injector_thread(
-    metrics: Shared<SystemMetrics>,
-    state: Shared<SystemState>,
-    emergency: Shared<bool>,
-    udp_sender: mpsc::Sender<String>,
-    running: Shared<bool>,
-    runtime_logger: Shared<File>,
-    simulation_start_time: Instant,
-)
+
+// ~~~~ SECTION 4: BENCHMARKING AND FAULT SIMULATION ~~~~~
+// 17. ---- FAULT INJECTOR ----
+fn fault_injector_thread(metrics: Shared<SystemMetrics>, state: Shared<SystemState>, udp_sender: mpsc::Sender<String>, running: Shared<bool>, log: Shared<File>, simulation_start_time: Instant,)
 {
-    write_runtime_log(
-        &runtime_logger,
-        &format!(
-            "[{}ms] [Faults] interval={}s  recovery_limit={}ms",
-            simulation_elapsed_ms(&simulation_start_time),
-            FAULT_INJECTION_INTERVAL,
-            RECOVERY_TIME_LIMIT
-        ),
+    let log_line = format!
+    (
+        "[{}ms] [Faults] interval={}s  recovery_limit={}ms type=CorruptedReading",  // only 1 type of fault
+        simulation_elapsed(&simulation_start_time),
+        FAULT_INJECTION_PERIOD,
+        RECOVERY_TIME_LIMIT
     );
- 
+    append_log(&log, &log_line);
+    
+    // Fault injection counter
     let mut fault_count: u32 = 0;
- 
+
     while is_running(&running)
     {
-        thread::sleep(Duration::from_secs(FAULT_INJECTION_INTERVAL));
- 
+        thread::sleep(Duration::from_millis(FAULT_INJECTION_PERIOD));
+
         if !is_running(&running)
         {
             break;
         }
- 
+
         fault_count += 1;
- 
-        // ── Lab 7: random fault selection ─────────────────────────────────────
-        let injected_fault = match rand::random_range(0u32..3)
-        {
-            0 => FaultType::SensorBusHang(80),
-            1 => FaultType::CorruptedReading,
-            _ => FaultType::PowerSpike,
-        };
- 
-        let fault_message = format!(
-            "[{}ms] [FAULT #{}] {:?}",
-            simulation_elapsed_ms(&simulation_start_time),
-            fault_count,
-            injected_fault
+
+        let fault_line = format!
+        (
+            "[{}ms] [FAULT #{}] CorruptedReading",
+            simulation_elapsed(&simulation_start_time),
+            fault_count
         );
- 
-        print_and_log_important(&runtime_logger, &fault_message);
- 
+        append_console_log(&log, &fault_line);
+
         {
-            let mut metrics_guard = metrics.lock().unwrap();
-            metrics_guard.fault_log.push(fault_message);
+            // Update metrics
+            let mut metrics_lock = metrics.lock().unwrap();
+            metrics_lock.fault_log.push(fault_message);
         }
- 
-        // serde: alert the GCS of the fault
-        send_ocs_message(
+
+        // Send a typed alert to GCS, using serde
+        send_ocs_message
+        (
             &udp_sender,
-            OcsMessage::Alert
+            OCSMessage::Alert 
             {
                 event: "fault".into(),
-                info: AlertInfo
-                {
-                    count: Some(fault_count),
-                    fault_type: Some(format!("{:?}", injected_fault)),
-                    ..Default::default()
-                },
+                misses: None,           // Not applicable for this fault
+                count: Some(fault_count),            
+                fault_type: Some("CorruptedReading".into()),     
             }
         );
- 
-        // ── Lab 7: match on fault variant to decide recovery action ───────────
-        match injected_fault
-        {
-            FaultType::SensorBusHang(hang_duration_milliseconds) =>
-            {
-                let line = format!(
-                    "[{}ms] [Faults] {}ms bus hang...",
-                    simulation_elapsed_ms(&simulation_start_time),
-                    hang_duration_milliseconds
-                );
-                print_and_log_important(&runtime_logger, &line);
- 
-                thread::sleep(Duration::from_millis(hang_duration_milliseconds));
-            }
- 
-            FaultType::CorruptedReading =>
-            {
-                let line = format!(
-                    "[{}ms] [Faults] Corrupted reading injected",
-                    simulation_elapsed_ms(&simulation_start_time)
-                );
-                print_and_log_important(&runtime_logger, &line);
-            }
- 
-            FaultType::PowerSpike =>
-            {
-                let line = format!(
-                    "[{}ms] [Faults] Power spike → DEGRADED + emergency",
-                    simulation_elapsed_ms(&simulation_start_time)
-                );
-                print_and_log_important(&runtime_logger, &line);
- 
-                *state.lock().unwrap() = SystemState::Degraded;
-                *emergency.lock().unwrap() = true;
-            }
-        }
- 
-        // ── Lab 3: Measure recovery time ─────────────────────────────────────
+
+        let response_line = format!
+        (
+            "[{}ms] [Faults] Discarding corrupted reading and recovering...",
+            simulation_elapsed(&simulation_start_time)
+        );
+        append_console_log(&log, &response_line);
+
+        // Measure recovery time
         let recovery_start_time = Instant::now();
- 
-        let recovery_line = format!(
-            "[{}ms] [Faults] Recovering...",
-            simulation_elapsed_ms(&simulation_start_time)
-        );
-        print_and_log_important(&runtime_logger, &recovery_line);
- 
-        thread::sleep(Duration::from_millis(50));  // simulate recovery work
- 
-        // Clear fault state
-        *emergency.lock().unwrap() = false;
-        *state.lock().unwrap() = SystemState::Normal;
- 
-        let recovery_time_milliseconds = recovery_start_time.elapsed().as_millis() as u64;
- 
-        let recovery_done_line = format!(
+        thread::sleep(Duration::from_millis(50)); // simulate recovery, 50 ms
+
+        let recovery_time = recovery_start_time.elapsed().as_millis() as u64;
+        let recovery_done_line = format!
+        (
             "[{}ms] [Faults] Recovery in {}ms",
-            simulation_elapsed_ms(&simulation_start_time),
-            recovery_time_milliseconds
+            simulation_elapsed(&simulation_start_time), // IFIXME: always 50?
+            recovery_time
         );
-        print_and_log_important(&runtime_logger, &recovery_done_line);
- 
-        {
-            let mut metrics_guard = metrics.lock().unwrap();
-            metrics_guard.recovery_times_milliseconds.push(recovery_time_milliseconds);
- 
-            if recovery_time_milliseconds > RECOVERY_TIME_LIMIT
+        append_console_log(&log, &recovery_done_line);
+
+        {   // Update metrics
+            let mut metrics_lock = metrics.lock().unwrap();
+            metrics_lock.recovery_times.push(recovery_time);
+
+            if recovery_time > RECOVERY_TIME_LIMIT
             {
-                let abort_message = format!(
-                    "[{}ms] !!! MISSION ABORT !!! recovery {}ms",
-                    simulation_elapsed_ms(&simulation_start_time),
-                    recovery_time_milliseconds
-                );
- 
-                print_and_log_important(&runtime_logger, &abort_message);
-                metrics_guard.safety_alerts.push(abort_message);
+                let abort_message = format!
+                (
+                    "[{}ms] !! MISSION ABORT !! recovery {}ms",
+                    simulation_elapsed(&simulation_start_time),
+                    recovery_time
+                ); //TODO: emergency lock?
+
+                append_console_log(&log, &abort_message);
+                metrics_lock.safety_alerts.push(abort_message);
                 *state.lock().unwrap() = SystemState::MissionAbort;
             }
         }
     }
- 
-    print_and_log_important(
-        &runtime_logger,
-        &format!(
+
+    append_console_log(&log, &format!
+        (
             "[{}ms] [Faults] Exit.",
-            simulation_elapsed_ms(&simulation_start_time)
+            simulation_elapsed(&simulation_start_time)
         ),
     );
 }
  
- 
-// =============================================================================
-//  FINAL METRICS REPORTER
-//
-//  Per your preference, reporting is done ONLY at the end of the simulation.
-//  No periodic reporter thread is used anymore.
-//
-//  This keeps the terminal clean and matches the assignment requirement of
-//  collecting runtime logs continuously while presenting an evaluation summary
-//  after execution.
-// =============================================================================
- 
-fn print_final_report(metrics: &SystemMetrics, simulation_end_time_ms: u64)
+// XXX: append report to logs for submission?
+// ~~~~ SECTION 5: FINAL METRICS REPORT ~~~~~
+// 18. ---- FINAL REPORT ----
+fn print_final_report(metrics: &SystemMetrics, simulation_end_time: u64)
 {
-    let packet_loss_percentage = if metrics.total_received_readings > 0
+    // Calculate packet loss percentage
+    let packet_loss;
+    if metrics.total_received > 0
     {
-        metrics.total_dropped_readings as f64 / metrics.total_received_readings as f64 * 100.0
+        packet_loss = metrics.total_dropped as f64 / metrics.total_received as f64 * 100.0;
     }
     else
     {
-        0.0
-    };
- 
-    let approximate_cpu_utilisation = if metrics.elapsed_time_milliseconds > 0
+        packet_loss = 0.0;
+    }
+
+    // Calculate approximate CPU utilisation
+    let cpu_utilisation;
+    if metrics.elapsed_time > 0
     {
-        metrics.active_time_milliseconds as f64 / metrics.elapsed_time_milliseconds as f64 * 100.0
+        cpu_utilisation = metrics.active_time as f64 / metrics.elapsed_time as f64 * 100.0;
     }
     else
     {
-        0.0
-    };
+        cpu_utilisation = 0.0;
+    }
  
     println!("\n╔══════════════════════════════════════════════════════════════════════╗");
-    println!("║  OCS FINAL REPORT  at {}ms", simulation_end_time_ms);
+    println!("║  OCS FINAL REPORT  at {}ms", simulation_end_time);
     println!("╠══════════════════════════════════════════════════════════════════════╣");
-    println!(
-        "║  Rx: {}  Dropped: {} ({:.2}%)",
-        metrics.total_received_readings,
-        metrics.total_dropped_readings,
-        packet_loss_percentage
-    );
-    println!("║  Jitter (µs)  limit={}µs", JITTER_WARNING_LIMIT_MICROSECONDS);
-    print_stat_row("Thermal [CRITICAL]", &metrics.thermal_jitter_microseconds);
-    print_stat_row("Accelerometer", &metrics.accelerometer_jitter_microseconds);
-    print_stat_row("Gyroscope", &metrics.gyroscope_jitter_microseconds);
- 
+    println!("║  Received: {}  Dropped: {} ({:.2}%)", metrics.total_received, metrics.total_dropped, packet_loss); // .2 = 2 decimal places
+    println!("║  Jitter (µs)  limit={}µs", THERMAL_JITTER_TIME_LIMIT);
+    print_row("Thermal [CRITICAL]", &metrics.thermal_jitter);
+    print_row("Accelerometer", &metrics.accelerometer_jitter);
+    print_row("Gyroscope", &metrics.gyroscope_jitter);
     println!("║  Drift (ms)");
-    print_stat_row("All tasks", &metrics.drift_milliseconds);
- 
+    print_row("All tasks", &metrics.drift);
     println!("║  Insert latency (µs)");
-    let insert_latency_values: Vec<i64> = metrics.insert_latency_microseconds
-        .iter()
-        .map(|&value| value as i64)
-        .collect();
-    print_stat_row("priority_buffer.push()", &insert_latency_values);
- 
-    println!("║  Deadline violations: {}", metrics.deadline_violations.len());
-    for violation in metrics.deadline_violations.iter().take(5)
+    let insert_latency_values: Vec<i64> = metrics.insert_latency.iter().map(|&value| value as i64).collect(); // it iterates over the values and maps them to i64, then collects the resulting vector
+    print_row("priority_buffer.push()", &insert_latency_values);
+    println!("║  Deadline violations: {}", metrics.deadline_log.len());
+
+    for violation in metrics.deadline_log.iter().take(5) // for each violation in deadline log, proceed to print but only the first 5
     {
         println!("║    {violation}");
     }
-    if metrics.deadline_violations.len() > 5
+    if metrics.deadline_log.len() > 5
     {
-        println!(
-            "║    ... and {} more",
-            metrics.deadline_violations.len() - 5
+        println!("║    ... and {} more", metrics.deadline_log.len() - 5 // print the number of violations minus the 5 already printed
         );
     }
- 
-    println!("║  Faults: {}", metrics.fault_log.len());
+
+    println!("║  Faults: {}", metrics.fault_log.len()); // print the number of faults
+
     for fault in &metrics.fault_log
     {
-        println!("║    {fault}");
+        println!("║    {fault}"); // print each fault
     }
- 
-    if !metrics.recovery_times_milliseconds.is_empty()
+    if !metrics.recovery_times.is_empty()
     {
-        let maximum_recovery_time = metrics.recovery_times_milliseconds.iter().max().unwrap();
-        let average_recovery_time = metrics.recovery_times_milliseconds.iter().sum::<u64>() as f64
-            / metrics.recovery_times_milliseconds.len() as f64;
- 
-        println!(
-            "║    recovery max={}ms  avg={:.1}ms",
-            maximum_recovery_time,
-            average_recovery_time
-        );
+        let maximum_recovery_time = metrics.recovery_times.iter().max().unwrap(); // get the maximum recovery time
+        let average_recovery_time = metrics.recovery_times.iter().sum::<u64>() as f64 / metrics.recovery_times.len() as f64; // formula = sum of recovery times / number of recovery times
+        println!("║    recovery max={}ms  avg={:.1}ms", maximum_recovery_time, average_recovery_time);
     }
  
-    println!("║  CPU ≈ {:.2}%", approximate_cpu_utilisation);
+    println!("║  CPU ≈ {:.2}%", cpu_utilisation);
  
     if !metrics.safety_alerts.is_empty()
     {
         println!("║  SAFETY ALERTS:");
         for alert in &metrics.safety_alerts
         {
-            println!("║    {alert}");
+            println!("║    {alert}"); // print each alert
         }
     }
- 
     println!("╚══════════════════════════════════════════════════════════════════════╝\n");
 }
 
-// =============================================================================
-// MAIN FUNCTION
-//
-// Sets up all shared state, spawns all OS threads, schedules RM background
-// tasks via ScheduledThreadPool, runs for the simulation duration, then
-// shuts everything down gracefully and prints a final end-of-run report.
-// =============================================================================
 
+// ~~~~ SECTION 6: MAIN FUNCTION ~~~~~
+// 18. ---- MAIN ----
+// Sets up all shared state, spawns all OS threads, schedules RM background tasks via ScheduledThreadPool
+// In the end, shuts everything down gracefully and prints final report
 fn main()
 {
-    println!("╔═══════════════════════════════════════════════════════╗");
-    println!("║  OCS — Satellite Onboard Control System              ║");
-    println!("║  CT087-3-3  |  Student A  |  Hard RTS / OS threads   ║");
-    println!("╚═══════════════════════════════════════════════════════╝\n");
+    println!("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
+    println!("|  SATELLITE ONBOARD CONTROL SYSTEM (OCS) - BY LUVEN MARK (TP071542) |");
+    println!("|  TYPE: HARD RTS, demonstrating the learnt Hard RTS concepts.       |");
+    println!("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n");
 
-    // ── Simulation Clock / Logger Initialization ─────────────────────────────
+    // Initialization
     let simulation_start_time: Instant = Instant::now();
-    let runtime_logger: Shared<File> = create_runtime_logger();
+    let log: Shared<File> = create_log();
+    append_log(&log, "[OCS] Startup sequence initiated.");
 
-    write_runtime_log(&runtime_logger, "OCS startup sequence initiated.");
+    // Creation of Shared State
+    let shared_priority_buffer: Shared<PriorityBuffer> = Arc::new(Mutex::new(PriorityBuffer::new(PRIORITY_BUFFER)));
+    let shared_system_metrics: Shared<SystemMetrics> = Arc::new(Mutex::new(SystemMetrics::new()));
+    let shared_system_state: Shared<SystemState> = Arc::new(Mutex::new(SystemState::Normal));
+    let shared_downlink_queue: Shared<Vec<DataPacket>> = Arc::new(Mutex::new(Vec::<DataPacket>::with_capacity(50))); // XXX: need?
+    let shared_emergency_flag: Shared<bool> = Arc::new(Mutex::new(false));
+    let shared_running_flag: Shared<bool> = Arc::new(Mutex::new(true));
 
-    // ── Shared State Setup ────────────────────────────────────────────────────
-    let shared_priority_buffer: Shared<PriorityBuffer> =
-        Arc::new(Mutex::new(PriorityBuffer::new(PRIORITY_BUFFER_CAPACITY)));
-
-    let shared_system_metrics: Shared<SystemMetrics> =
-        Arc::new(Mutex::new(SystemMetrics::new()));
-
-    let shared_system_state: Shared<SystemState> =
-        Arc::new(Mutex::new(SystemState::Normal));
-
-    let shared_downlink_data_queue: Shared<Vec<DataPacket>> =
-        Arc::new(Mutex::new(Vec::<DataPacket>::with_capacity(50)));
-
-    let shared_emergency_flag: Shared<bool> =
-        Arc::new(Mutex::new(false));
-
-    let shared_running_flag: Shared<bool> =
-        Arc::new(Mutex::new(true));
-
-    // ── UDP Telemetry Channel ────────────────────────────────────────────────
+    // UDP Channel
     let (telemetry_sender, telemetry_receiver) = mpsc::channel::<String>();
 
-    println!("[OCS] Configuration:");
-    println!("      Telemetry → GCS : {GCS_TELEMETRY_ADDRESS}  (serde encoded)");
-    println!("      Commands  ← GCS : {OCS_COMMAND_BIND_ADDRESS}  (serde decoded)");
-    println!("      Buffer capacity : {PRIORITY_BUFFER_CAPACITY}");
-    println!("      Radio typestate : Idle → Transmitting");
-    println!("      RM pool tasks   : health / compress / antenna");
-    println!("      Sim duration    : {SIMULATION_DURATION_SECONDS}s\n");
+    // Configuration on Console
+    println!("[OCS] Configuration");
+    println!("~~~~~~~~~~~~~~~~~~~");
+    println!(" Telemetry -> GCS : {GCS_TELEMETRY_ADDRESS}");
+    println!(" Commands  <- GCS : {OCS_COMMAND_ADDRESS}");
+    println!(" Buffer capacity  : {PRIORITY_BUFFER}");
+    println!(" Typestate (Radio): Idle -> Transmitting");
+    println!(" RM pool tasks    : health / compress / antenna");
+    println!(" Sim duration     : {SIMULATION_DURATION}s\n");
+    append_log(&log, "[OCS] System configuration completed.");
 
-    write_runtime_log(&runtime_logger, "System configuration completed.");
-
-    // ── Thread Handles ───────────────────────────────────────────────────────
-    let mut operating_system_thread_handles: Vec<thread::JoinHandle<()>> = Vec::new();
+    // Operating System (OS) Thread 
+    let mut os_thread_handles: Vec<thread::JoinHandle<()>> = Vec::new(); // JoinHandle =  used to wait for the thread to finish
 
     // UDP sender thread
-    operating_system_thread_handles.push(thread::spawn({
-        let logger = Arc::clone(&runtime_logger);
+    os_thread_handles.push(thread::spawn
+    ({
+        let logger = Arc::clone(&log);
         let start  = simulation_start_time;
-        let rx     = telemetry_receiver;
-        move || udp_sender_thread(rx, logger, start)
+        let receiver = telemetry_receiver;
+        move || udp_sender_thread(receiver, logger, start) // move ownership and start to the thread
     }));
 
-    // Command receiver thread
-    operating_system_thread_handles.push(thread::spawn({
-        let running = Arc::clone(&shared_running_flag);
-        let logger  = Arc::clone(&runtime_logger);
-        let start   = simulation_start_time;
+    // UDP receiver thread
+    os_thread_handles.push(thread::spawn
+    ({
+        let running = Arc::clone(&shared_running_flag);  // need to clone as the Arc is shared
+        let logger = Arc::clone(&log);
+        let start = simulation_start_time;
         move || command_receiver_thread(running, logger, start)
     }));
 
-    // Thermal sensor thread
-    operating_system_thread_handles.push(thread::spawn({
-        let buf       = Arc::clone(&shared_priority_buffer);
-        let metrics   = Arc::clone(&shared_system_metrics);
-        let state     = Arc::clone(&shared_system_state);
+    // SENSOR 1: Thermal thread
+    os_thread_handles.push(thread::spawn
+    ({
+        let buffer = Arc::clone(&shared_priority_buffer);
+        let metrics = Arc::clone(&shared_system_metrics);
+        let state = Arc::clone(&shared_system_state);
         let emergency = Arc::clone(&shared_emergency_flag);
-        let tx        = telemetry_sender.clone();
-        let running   = Arc::clone(&shared_running_flag);
-        let logger    = Arc::clone(&runtime_logger);
-        let start     = simulation_start_time;
-        move || thermal_sensor_thread(buf, metrics, state, emergency, tx, running, logger, start)
-    }));
-
-    // Accelerometer thread
-    operating_system_thread_handles.push(thread::spawn({
-        let buf     = Arc::clone(&shared_priority_buffer);
-        let metrics = Arc::clone(&shared_system_metrics);
-        let tx      = telemetry_sender.clone();
+        let transmit = telemetry_sender.clone();
         let running = Arc::clone(&shared_running_flag);
-        let logger  = Arc::clone(&runtime_logger);
-        let start   = simulation_start_time;
-        move || accelerometer_thread(buf, metrics, tx, running, logger, start)
+        let logger = Arc::clone(&log);
+        let start = simulation_start_time;
+        move || thermal_thread(buffer, metrics, state, emergency, transmit, running, logger, start)
     }));
 
-    // Gyroscope thread
-    operating_system_thread_handles.push(thread::spawn({
-        let buf     = Arc::clone(&shared_priority_buffer);
+    // SENSOR 2: Accelerometer thread
+    os_thread_handles.push(thread::spawn
+    ({
+        let buffer = Arc::clone(&shared_priority_buffer);
         let metrics = Arc::clone(&shared_system_metrics);
-        let tx      = telemetry_sender.clone();
+        let state = Arc::clone(&shared_system_state); 
+        let transmit = telemetry_sender.clone();
         let running = Arc::clone(&shared_running_flag);
-        let logger  = Arc::clone(&runtime_logger);
-        let start   = simulation_start_time;
-        move || gyroscope_thread(buf, metrics, tx, running, logger, start)
+        let logger = Arc::clone(&log);
+        let start = simulation_start_time;
+        move || accelerometer_thread(buffer, metrics, transmit, running, logger, start)
     }));
 
-    // ── ScheduledThreadPool for RM Background Tasks ──────────────────────────
+    // SENSOR 3: Gyroscope thread
+    os_thread_handles.push(thread::spawn
+    ({
+        let buffer = Arc::clone(&shared_priority_buffer);
+        let metrics = Arc::clone(&shared_system_metrics);
+        let state = Arc::clone(&shared_system_state);
+        let transmit = telemetry_sender.clone();
+        let running = Arc::clone(&shared_running_flag);
+        let logger = Arc::clone(&log);
+        let start = simulation_start_time;
+        move || gyroscope_thread(buffer, metrics, transmit, running, logger, start)
+    }));
+
+    // ScheduledThreadPool for 3 Rate Monotonic Tasks
     let rate_monotonic_thread_pool = ScheduledThreadPool::new(3);
 
-    rate_monotonic_thread_pool.execute_at_fixed_rate(
-        Duration::from_millis(10),
-        Duration::from_millis(HEALTH_MONITOR_PERIOD),
-        make_health_monitor_task(
+    rate_monotonic_thread_pool.execute_at_fixed_rate // fixed rate means that the task will be executed at fixed intervals
+    (
+        Duration::from_millis(10),                  // task will be executed every 10ms
+        Duration::from_millis(HEALTH_MONITOR_PERIOD),       // XXX: change duration
+        health_monitor_task
+        (
             Arc::clone(&shared_priority_buffer),
             Arc::clone(&shared_system_metrics),
             Arc::clone(&shared_system_state),
             telemetry_sender.clone(),
             Arc::clone(&shared_running_flag),
-            Arc::clone(&runtime_logger),
+            Arc::clone(&log),
             simulation_start_time,
         ),
     );
 
-    rate_monotonic_thread_pool.execute_at_fixed_rate(
-        Duration::from_millis(20),
+    rate_monotonic_thread_pool.execute_at_fixed_rate
+    (
+        Duration::from_millis(20),                  // task will be executed every 20ms
         Duration::from_millis(DATA_COMPRESSION_PERIOD),
-        make_data_compression_task(
+        data_compression_task
+        (
             Arc::clone(&shared_priority_buffer),
-            Arc::clone(&shared_downlink_data_queue),
+            Arc::clone(&shared_downlink_queue),
             Arc::clone(&shared_system_metrics),
             Arc::clone(&shared_running_flag),
-            Arc::clone(&runtime_logger),
+            Arc::clone(&log),
             simulation_start_time,
         ),
     );
 
-    rate_monotonic_thread_pool.execute_at_fixed_rate(
-        Duration::from_millis(30),
+    rate_monotonic_thread_pool.execute_at_fixed_rate
+    (
+        Duration::from_millis(30),                  // task will be executed every 30ms
         Duration::from_millis(ANTENNA_ALIGNMENT_PERIOD),
-        make_antenna_alignment_task(
+        antenna_alignment_task
+        (
             Arc::clone(&shared_system_metrics),
             Arc::clone(&shared_system_state),
             Arc::clone(&shared_emergency_flag),
             Arc::clone(&shared_running_flag),
-            Arc::clone(&runtime_logger),
+            Arc::clone(&log),
             simulation_start_time,
         ),
     );
 
     // Downlink thread
-    operating_system_thread_handles.push(thread::spawn({
-        let dq      = Arc::clone(&shared_downlink_data_queue);
+    os_thread_handles.push(thread::spawn
+    ({
+        let downlink_queue = Arc::clone(&shared_downlink_queue);
         let metrics = Arc::clone(&shared_system_metrics);
-        let state   = Arc::clone(&shared_system_state);
-        let tx      = telemetry_sender.clone();
+        let state = Arc::clone(&shared_system_state);
+        let transmit = telemetry_sender.clone();
         let running = Arc::clone(&shared_running_flag);
-        let logger  = Arc::clone(&runtime_logger);
-        let start   = simulation_start_time;
-        move || downlink_thread(dq, metrics, state, tx, running, logger, start)
+        let logger = Arc::clone(&log);
+        let start = simulation_start_time;
+        move || downlink_thread(dq, metrics, state, transmit, running, logger, start)
     }));
 
     // Fault injector thread
-    operating_system_thread_handles.push(thread::spawn({
-        let metrics   = Arc::clone(&shared_system_metrics);
-        let state     = Arc::clone(&shared_system_state);
+    os_thread_handles.push(thread::spawn
+    ({
+        let metrics = Arc::clone(&shared_system_metrics);
+        let state = Arc::clone(&shared_system_state);
         let emergency = Arc::clone(&shared_emergency_flag);
-        let tx        = telemetry_sender.clone();
-        let running   = Arc::clone(&shared_running_flag);
-        let logger    = Arc::clone(&runtime_logger);
-        let start     = simulation_start_time;
-        move || fault_injector_thread(metrics, state, emergency, tx, running, logger, start)
+        let transmit = telemetry_sender.clone();
+        let running = Arc::clone(&shared_running_flag);
+        let logger = Arc::clone(&log);
+        let start = simulation_start_time;
+        move || fault_injector_thread(metrics, state, emergency, transmit, running, logger, start)
     }));
 
     // Drop the final sender so udp_sender_thread can exit cleanly
     drop(telemetry_sender);
 
-    println!(
+    println!
+    (
         "[OCS] {} OS threads + 3 ScheduledThreadPool tasks online. Running for {}s...\n",
-        operating_system_thread_handles.len(),
-        SIMULATION_DURATION_SECONDS
+        os_thread_handles.len(),
+        SIMULATION_DURATION
     );
+    append_log(&log, "[OCS] All OCS threads and RM tasks are online.");
 
-    write_runtime_log(&runtime_logger, "All OCS threads and RM tasks are online.");
+    // Run for the Simulation Duration
+    thread::sleep(Duration::from_secs(SIMULATION_DURATION));
 
-    // ── Run for the Simulation Duration ──────────────────────────────────────
-    thread::sleep(Duration::from_secs(SIMULATION_DURATION_SECONDS));
-
-    // ── Graceful Shutdown ─────────────────────────────────────────────────────
+    // Own version of Graceful Shutdown (Hard RTS)
     println!("\n[OCS] Simulation ended — signalling shutdown...");
-    write_runtime_log(&runtime_logger, "Simulation duration elapsed. Shutdown initiated.");
+    append_log(&log, "[OCS] Simulation duration elapsed. Shutdown initiated.");
 
-    *shared_running_flag.lock().unwrap() = false;
+    *shared_running_flag.lock().unwrap() = false;   // signal shutdown with running flag set to false
 
+    // Drop the rate monotonic thread pool so it can exit cleanly
     drop(rate_monotonic_thread_pool);
 
-    for handle in operating_system_thread_handles
+    // Wait for all threads to join (all threads will need to complete before the main thread exits)
+    for handle in os_thread_handles
     {
         let _ = handle.join();
     }
+    append_log(&log, "[OCS] All OCS threads joined successfully.");
 
-    write_runtime_log(&runtime_logger, "All OCS threads joined successfully.");
-
-    // ── Final Summary Report ──────────────────────────────────────────────────
+    // Final Report 
     println!("\n[OCS] FINAL REPORT:");
-    {
-        let metrics_guard = shared_system_metrics.lock().unwrap();
-        let end_ms = simulation_elapsed_ms(&simulation_start_time);
-        print_final_report(&metrics_guard, end_ms);
+    {   // Lock and print final report
+        let metrics_lock = shared_system_metrics.lock().unwrap();
+        let end = simulation_elapsed(&simulation_start_time);
+        print_final_report(&metrics_lock, end);
     }
 
-    write_runtime_log(&runtime_logger, "Final report generated.");
-    println!("[OCS] Done.");
+    append_log(&log, "[OCS] Final report generated.");
+    println!("[OCS] System Shutdown Complete.");    // Main Thread exits
 }
