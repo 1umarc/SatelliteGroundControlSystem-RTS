@@ -22,9 +22,9 @@ use serde_json;                             // the actual JSON encoding/decoding
 // Rate Monotonic Command Periods (milliseconds)
 // Use all caps for constants to follow snake_case
 // Shorter period = higher priority under Rate Monotonic scheduling
-const THERMAL_COMMAND_PERIOD: u64 = 25;   // RM Priority 1 — fastest, so highest priority
-const ACCELEROMETER_COMMAND_PERIOD: u64 = 60;  // RM Priority 2
-const GYROSCOPE_COMMAND_PERIOD: u64 = 175;  // RM Priority 3 — slowest, so lowest priority
+const THERMAL_COMMAND_PERIOD: u64 = 200;   // RM Priority 1 — fastest, so highest priority
+const ACCELEROMETER_COMMAND_PERIOD: u64 = 400;  // RM Priority 2
+const GYROSCOPE_COMMAND_PERIOD: u64 = 600;  // RM Priority 3 — slowest, so lowest priority
 
 // Deadline limits from the assignment spec
 const DECODE_DEADLINE: u64 = 3;    // telemetry must be decoded within 3ms
@@ -35,8 +35,8 @@ const FAULT_RESPONSE_LIMIT: u64 = 100;  // interlock must engage within 100ms of
 const LOSS_OF_CONTACT_MISS_THRESHOLD: u32 = 3;
 // if we miss 3 or more packets in a row, we declare loss of contact
 
-const REREQUEST_INTERVAL: u64 = 250;
-// check for silence every 250ms — quick enough to notice, not so fast we spam requests
+const REREQUEST_INTERVAL: u64 = 500;
+// check for silence every 500ms — quick enough to notice, not so fast we spam requests
 
 // Jitter warning limit in microseconds
 const UPLINK_JITTER_LIMIT: i64 = 2000;
@@ -1187,8 +1187,6 @@ async fn metrics_reporter_task(metrics: Shared<GCSMetrics>, _: Shared<GCSState>,
 // ===============
 fn print_report(metric: &GCSMetrics, state: &GCSState, simulation_start: &Instant)
 {
-    let elapsed_time = simulation_start.elapsed().as_millis();
-
     // Calculate command rejection percentage
     let reject_percentage = if metric.commands_sent + metric.commands_rejected > 0
     {
@@ -1210,46 +1208,46 @@ fn print_report(metric: &GCSMetrics, state: &GCSState, simulation_start: &Instan
         metric.backlog_depth_samples.iter().sum::<usize>() as f64 / metric.backlog_depth_samples.len() as f64
     };
 
-    println!("\n╔══════════════════════════════════════════════════════╗");
-    println!( "║  GCS REPORT  at {elapsed_time}ms simulation time");
-    println!( "╠══════════════════════════════════════════════════════╣");
+    println!("\n|==============================================================================================|");
+    println!( "|                            GCS FINAL REPORT - BY CHONG CHUN KIT (TP077436)                   |");
+    println!( "|==============================================================================================|");
     println!(
-        "║  Mode: {}  Loss of Contact: {}",
+        "|  Mode: {}  Loss of Contact: {}",
         if state.fault_active {"FaultLocked"} else {"Normal"},
         state.loss_of_contact,
     );
     println!(
-        "║  Telemetry: receiver={}  missed={}",
+        "|  Telemetry: receiver={}  missed={}",
         metric.telemetry_received, metric.missed_packets
     );
     println!(
-        "║  Backlog depth  avg={:.1}  peak={}  channel_cap=100",
+        "|  Backlog depth  avg={:.1}  peak={}  channel_cap=100",
         avg_backlog_depth, metric.backlog_peak
     );
     println!(
-        "║  Decode latency (µs)  deadline={}ms  (spawn_blocking)",
+        "|  Decode latency (µs)  deadline={}ms  (spawn_blocking)",
         DECODE_DEADLINE
     );
     let decode_samples: Vec<i64> = metric.decode_latency.iter().map(|&v| v as i64).collect();
     print_stat_row("Decode (µs)", &decode_samples);
     println!(
-        "║  Commands  sent={}  rejected={} ({:.1}%)",
+        "|  Commands  sent={}  rejected={} ({:.1}%)",
         metric.commands_sent, metric.commands_rejected, reject_percentage
     );
     println!(
-        "║  Dispatch latency (µs)  deadline={}ms",
+        "|  Dispatch latency (µs)  deadline={}ms",
         DISPATCH_DEADLINE
     );
     let dispatch_samples: Vec<i64> = metric.dispatch_latency.iter().map(|&v| v as i64).collect();
     print_stat_row("Dispatch (µs)", &dispatch_samples);
-    println!("║  Uplink jitter (µs)  limit={}µs", UPLINK_JITTER_LIMIT);
+    println!("|  Uplink jitter (µs)  limit={}µs", UPLINK_JITTER_LIMIT);
     print_stat_row("ThermalCheck       RM-P1", &metric.thermal_jitter);
     print_stat_row("AccelerometerCheck RM-P2", &metric.accelerometer_jitter);
     print_stat_row("GyroscopeCheck     RM-P3", &metric.gyroscope_jitter);
-    println!("║  Drift (ms)");
+    println!("|  Drift (ms)");
     print_stat_row("All tasks", &metric.drift);
     println!(
-        "║  Faults: {}  Critical alerts: {}",
+        "|  Faults: {}  Critical alerts: {}",
         metric.faults_received, metric.critical_alerts.len()
     );
     if !metric.interlock_latency.is_empty()
@@ -1257,33 +1255,33 @@ fn print_report(metric: &GCSMetrics, state: &GCSState, simulation_start: &Instan
         let interlock_samples: Vec<i64> = metric.interlock_latency.iter().map(|&v| v as i64).collect();
         print_stat_row("Interlock Latency (ms)", &interlock_samples);
     }
-    println!("║  Deadline violations: {}", metric.deadline_violations.len());
+    println!("|  Deadline violations: {}", metric.deadline_violations.len());
     for violation in metric.deadline_violations.iter().take(3)
     {
-        println!("║    {violation}");
+        println!("|    {violation}");
     }
     if metric.deadline_violations.len() > 3
     {
-        println!("║    ... and {} more", metric.deadline_violations.len() - 3);
+        println!("|    ... and {} more", metric.deadline_violations.len() - 3);
     }
     if !metric.rejection_log.is_empty()
     {
-        println!("║  Rejections: {}", metric.rejection_log.len());
+        println!("|  Rejections: {}", metric.rejection_log.len());
         for rejection in metric.rejection_log.iter().take(2)
         {
-            println!("║    {rejection}");
+            println!("|    {rejection}");
         }
     }
-    println!("║  CPU ≈ {cpu_estimate:.2}%");
+    println!("|  CPU ≈ {cpu_estimate:.2}%");
     if !metric.critical_alerts.is_empty()
     {
-        println!("║  CRITICAL ALERTS:");
+        println!("|  CRITICAL ALERTS:");
         for alert in &metric.critical_alerts
         {
-            println!("║    {alert}");
+            println!("|    {alert}");
         }
     }
-    println!("╚══════════════════════════════════════════════════════╝\n");
+    println!("|==============================================================================================|\n");
 }
 
 // ===============
@@ -1292,10 +1290,10 @@ fn print_report(metric: &GCSMetrics, state: &GCSState, simulation_start: &Instan
 #[tokio::main]
 async fn main()
 {
-    println!("╔════════════════════════════════════════════════════════════════╗");
-    println!("║  GROUND CONTROL STATION (GCS) — BY CHONG CHUN KIT (TP077436)   ║");
-    println!("║  TYPE: SOFT RTS, demonstrating the learnt Soft RTS concepts.   ║");
-    println!("╚════════════════════════════════════════════════════════════════╝\n");
+    println!("|=======================================================================================================|");
+    println!("|                         GROUND CONTROL STATION (GCS) — BY CHONG CHUN KIT (TP077436)                   |");
+    println!("|                         TYPE: SOFT RTS, demonstrating the learnt Soft RTS concepts.                   |");
+    println!("|=======================================================================================================|\n");
 
     // Record when the simulation started so we can measure elapsed time throughout
     let simulation_start = Instant::now();
