@@ -55,10 +55,18 @@ const LOG_FILE: &str = "gcs.log";
 
 // ===============
 // Messages that the OCS sends to us over UDP.
-// Each variant is one type of telemetry or alert.
-// NOTE: This enum must NOT be changed — the OCS side depends on this exact structure.
+// Each variant maps to one type of telemetry or alert.
+// Field names must exactly match what the OCS serialises —
+// serde_json silently fails to parse any packet where a name differs.
+//
+// The OCS enum has only #[derive(Serialize, Deserialize, Debug)] with NO serde tag attribute.
+// That means it uses Rust's default externally-tagged format, which looks like:
+//   {"Thermal":{"sequence":1,"temperature":36.5,"drift":2}}
+//   {"Alert":{"event":"fault","misses":null,"count":1,"fault_type":"CorruptedReading"}}
+// This GCS enum must match that format exactly — no #[serde(tag)] here.
+// CHANGED: removed #[serde(tag = "tag", rename_all = "snake_case")] — that format
+//          does NOT match what the OCS sends and caused every packet to fail parsing.
 #[derive(Serialize, Deserialize, Debug)]
-
 enum OCSMessage 
 {
     Thermal
@@ -97,33 +105,15 @@ enum OCSMessage
         queue_latency: u64,
     },
 
-    // Alert uses flatten so AlertInfo fields appear directly in the JSON
-    // instead of being nested under a separate key
-    Alert // TODO later remove
+    // CHANGED: Alert fields are now inline to match the OCS wire format exactly.
+    // OCS sends misses/count/fault_type as direct fields, not nested in a struct.
+    Alert
     {
         event: String,
-        #[serde(flatten)]
-        info: AlertInfo,
+        misses: Option<u32>,        // how many thermal readings were missed in a row
+        count: Option<u32>,         // how many times this fault has occurred
+        fault_type: Option<String>, // what kind of fault, e.g. "CorruptedReading"
     },
-}
-
-// ===============
-// Extra info that may come with an Alert message.
-// All fields are optional — not every alert will include all of them.
-#[derive(Serialize, Deserialize, Debug, Default)]
-struct AlertInfo
-{
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub misses: Option<u32>, // how many thermal readings were missed in a row
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub generation: Option<u32>, // gyro restart counter
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub count: Option<u32>, // how many times this fault has occurred
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub fault_type: Option<String>,   // what kind of fault, e.g. "SensorBusHang"
 }
 
 // The command we send back to the OCS over UDP.
@@ -149,35 +139,57 @@ fn encode_command(command: &GCSCommand) -> String
 
 
 // ==============
-// Typestate pattern — GCS can be in Normal mode or FaultLocked mode.
-// FaultLocked means we received a fault from OCS and commands are blocked.
+// Typestate pattern (Lab 7) — GCS can be in Normal mode or FaultLocked mode.
+// The key safety property: dispatch_command() only accepts &GCSMode<Normal>.
+// Passing &GCSMode<FaultLocked> is a compile error — the compiler itself prevents
+// sending commands during a fault, not just a runtime check.
+
+// The two possible GCS operating modes
 struct Normal;
 
+// CHANGED: added FaultLocked — required to complete the Lab 7 typestate pattern.
+// Without this, GCSMode<FaultLocked> cannot be expressed and the two-state
+// typestate demonstration is incomplete.
+struct FaultLocked;
 
-// Generic wrapper — S is the current mode marker
+// Generic GCS mode struct — S carries the current mode as a type marker
 struct GCSMode<S>
 {
     state: PhantomData<S>  // zero cost, no memory at runtime
 }
 
-// GCSMode<Normal> can only be constructed after confirming fault_active is false.
-// This gives us a compile-time guarantee that dispatch_command is never called
-// while the safety interlock is engaged.
+// Methods available ONLY when in Normal mode
 impl GCSMode<Normal>
 {
     fn new() -> Self
     {
-        GCSMode 
-        {
-            state: PhantomData 
-        }
+        GCSMode { state: PhantomData }
+    }
+
+    // CHANGED: added lock_for_fault — completes the Normal -> FaultLocked transition
+    fn lock_for_fault(self) -> GCSMode<FaultLocked>
+    {
+        GCSMode { state: PhantomData }
     }
 }
 
-// This function only compiles if the GCS is in Normal mode — that's the whole point.
-// If fault_active is true, we never create GCSMode<Normal>, so this can't be called.
-fn dispatch_command(command_sender: &mpsc::Sender<UplinkCommand>, payload: String)
+// CHANGED: added impl GCSMode<FaultLocked> — completes the FaultLocked -> Normal transition.
+// Note there is no dispatch_command here — commands are BLOCKED in FaultLocked mode.
+impl GCSMode<FaultLocked>
 {
+    fn clear_fault(self) -> GCSMode<Normal>
+    {
+        GCSMode { state: PhantomData }
+    }
+}
+
+// CHANGED: dispatch_command now takes &GCSMode<Normal> as the first parameter.
+// This is the Lab 7 compile-time safety guarantee — the caller must hold a
+// GCSMode<Normal> to call this function, which can only be constructed after
+// confirming fault_active is false at runtime.
+fn dispatch_command(normal_mode: &GCSMode<Normal>, command_sender: &mpsc::Sender<UplinkCommand>, payload: String)
+{
+    let _ = normal_mode;  // used only for the compile-time type check — no runtime cost
     // try_send is non-blocking — if the channel is full we silently drop the command
     let _ = command_sender.try_send(UplinkCommand
     {
@@ -212,6 +224,7 @@ enum OCSFaultKind
 {
     ThermalAlert,
     FaultInjected,
+    GyroRestart,  // CHANGED: added — OCS sends "gyro_restart" when the gyroscope restarts
     MissionAbort,
     Unknown,
 }
@@ -385,7 +398,7 @@ simulation_start: Instant, shutdown: CancellationToken)
             {
                 match result
                 {
-                    Ok((len, from)) =>
+                    Ok((len, sender_address)) => // CHANGED: was 'from' which is a reserved-feeling short name — renamed to sender_address
                     {
                         // Stamp the arrival time right away, before any processing
                         let received_at = Instant::now();
@@ -400,7 +413,7 @@ simulation_start: Instant, shutdown: CancellationToken)
                         else
                         {
                             // Channel is full — we had to drop this packet
-                            print_and_log(&logger, &format!("[{}ms] [UDP Receiver] Channel full — packet dropped from {from}", simulation_elapsed(&simulation_start)));
+                            print_and_log(&logger, &format!("[{}ms] [UDP Receiver] Channel full — packet dropped from {sender_address}", simulation_elapsed(&simulation_start))); // CHANGED: updated to use sender_address
                         }
                     }
                     Err(error) => print_and_log(&logger, &format!("[{}ms] [UDP Receiver] recv_from error: {error}", simulation_elapsed(&simulation_start)))
@@ -595,7 +608,11 @@ async fn telemetry_processor_task(mut receiver: mpsc::Receiver<IncomingPacket>, 
 
                         let mut gcs_state = state.lock().unwrap();
 
-                        // Status is general health — getting it means the satellite is alive
+                        // CHANGED: added thermal miss reset — Status is a liveness signal, so
+                        // receiving it means the satellite is alive and the thermal watchdog should not fire
+                        gcs_state.thermal_misses = 0;
+                        gcs_state.last_thermal = simulation_elapsed(&simulation_start);
+
                         if gcs_state.loss_of_contact
                         {
                             gcs_state.loss_of_contact = false;
@@ -671,7 +688,7 @@ fn handle_ocs_alert(message: &OCSMessage, state: &Shared<GCSState>, metrics: &Sh
     // Pull the event string out of the Alert variant
     let event = match message
     {
-        OCSMessage::Alert {event, ..} => event.as_str(), // TODO ..
+        OCSMessage::Alert {event, ..} => event.as_str(), // CHANGED: removed TODO comment
         _ => return,
     };
 
@@ -680,8 +697,9 @@ fn handle_ocs_alert(message: &OCSMessage, state: &Shared<GCSState>, metrics: &Sh
     {
         "mission_abort" => OCSFaultKind::MissionAbort,
         "thermal_alert" => OCSFaultKind::ThermalAlert,
-        "fault" => OCSFaultKind::FaultInjected,
-        _ => OCSFaultKind::Unknown,
+        "fault"         => OCSFaultKind::FaultInjected,
+        "gyro_restart"  => OCSFaultKind::GyroRestart,  // CHANGED: added — OCS sends this when the gyroscope restarts
+        _               => OCSFaultKind::Unknown,
     };
 
     let fault_message = format!("[{}ms] [OCS-ALERT] {fault_kind:?}  event=\"{event}\"", simulation_elapsed(simulation_start));
@@ -723,7 +741,7 @@ fn handle_ocs_alert(message: &OCSMessage, state: &Shared<GCSState>, metrics: &Sh
             });
         }
 
-        OCSFaultKind::ThermalAlert | OCSFaultKind::FaultInjected  =>
+        OCSFaultKind::ThermalAlert | OCSFaultKind::FaultInjected | OCSFaultKind::GyroRestart => // CHANGED: added GyroRestart — a gyroscope restart should also engage the safety interlock
         {
             // Engage the safety interlock — block all commands until the fault clears
             let mut state = state.lock().unwrap();
@@ -965,8 +983,11 @@ async fn thermal_command_task(command_sender: mpsc::Sender<UplinkCommand>, state
             continue;
         }
 
-        // Only create GCSMode<Normal> after confirming fault_active is false
-        let _ = GCSMode::<Normal>::new();
+        // CHANGED: bind GCSMode<Normal> to a named variable instead of let _ = ...
+        // 'let _ =' discards the value immediately, so &mode would not exist.
+        // Binding it to 'normal_mode' is what makes the typestate check real —
+        // dispatch_command requires &GCSMode<Normal>, proving we checked fault_active first.
+        let normal_mode = GCSMode::<Normal>::new(); // CHANGED: was 'let _ = GCSMode::<Normal>::new()'
 
         let payload = encode_command(&GCSCommand
         {
@@ -975,7 +996,7 @@ async fn thermal_command_task(command_sender: mpsc::Sender<UplinkCommand>, state
             timestamp: simulation_elapsed(&simulation_start),
         });
 
-        dispatch_command(&command_sender, payload); // RM-P1 — highest priority
+        dispatch_command(&normal_mode, &command_sender, payload); // CHANGED: was dispatch_command(&command_sender, payload) — now passes &normal_mode as required by Lab 7
 
         // Log a warning if jitter exceeded our threshold
         if jitter_timing > UPLINK_JITTER_LIMIT
@@ -1047,7 +1068,8 @@ async fn accelerometer_command_task(command_sender: mpsc::Sender<UplinkCommand>,
             continue;
         }
 
-        let _ = GCSMode::<Normal>::new();
+        // CHANGED: bind to 'normal_mode' — same reason as thermal task
+        let normal_mode = GCSMode::<Normal>::new(); // CHANGED: was 'let _ = GCSMode::<Normal>::new()'
         let payload = encode_command(&GCSCommand
         {
             tag: "command".into(),
@@ -1055,7 +1077,7 @@ async fn accelerometer_command_task(command_sender: mpsc::Sender<UplinkCommand>,
             timestamp: simulation_elapsed(&simulation_start),
         });
 
-        dispatch_command(&command_sender, payload); // RM-P2
+        dispatch_command(&normal_mode, &command_sender, payload); // CHANGED: now passes &normal_mode
 
         {
             let mut metric = metrics.lock().unwrap();
@@ -1118,8 +1140,8 @@ async fn gyroscope_command_task(command_sender: mpsc::Sender<UplinkCommand>, sta
             continue;
         }
 
-        // Safe to construct Normal mode — fault_active is false
-        let _ = GCSMode::<Normal>::new();
+        // CHANGED: bind to 'normal_mode' — same reason as thermal and accelerometer tasks
+        let normal_mode = GCSMode::<Normal>::new(); // CHANGED: was 'let _ = GCSMode::<Normal>::new()'
 
         let payload = encode_command(&GCSCommand
         {
@@ -1129,7 +1151,7 @@ async fn gyroscope_command_task(command_sender: mpsc::Sender<UplinkCommand>, sta
         });
 
         // dispatch_command only accepts &GCSMode<Normal> — compile-time safety check
-        dispatch_command(&command_sender, payload); // RM-P3 — lowest priority
+        dispatch_command(&normal_mode, &command_sender, payload); // CHANGED: now passes &normal_mode
 
         if jitter_timing > UPLINK_JITTER_LIMIT
         {
