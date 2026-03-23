@@ -1244,7 +1244,7 @@ fn print_report(metric: &GCSMetrics, state: &GCSState)
         let interlock_samples: Vec<i64> = metric.interlock_latency.iter().map(|&v| v as i64).collect();
         print_stat_row("Interlock Latency (ms)", &interlock_samples);
     }
-    println!("|  Deadline violations: {}", metric.deadline_violations.len());
+    println!("|  Deadline / Warn violations: {}", metric.deadline_violations.len());
     for violation in metric.deadline_violations.iter().take(3)
     {
         println!("|    {violation}");

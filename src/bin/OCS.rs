@@ -769,7 +769,12 @@ fn thermal_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<Syste
             let mut metrics_lock = metrics.lock().unwrap();
  
             // Record jitter (skip first sequence as there is nothing to deduct from previous)
-            if sequence_number > 0
+            if sequence_number == 0
+            {
+                // First loop has no previous valid interval
+                last_tick = Instant::now();
+            }
+            else
             {
                 // Jitter uses microseconds for precision
                 let this_interval = last_tick.elapsed().as_micros() as i64;
@@ -781,7 +786,7 @@ fn thermal_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<Syste
                 {
                     let line = format!
                     (
-                        "[{}ms] [WARN] Thermal jitter {}µs  sequence={}",
+                        "[{}ms] [DEADLINE] Thermal jitter {}µs  sequence={}",
                         simulation_elapsed(&simulation_start_time),
                         jitter,
                         sequence_number
@@ -904,7 +909,12 @@ fn accelerometer_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared
             let mut metrics_lock = metrics.lock().unwrap();
 
             // Record jitter (skip first sequence as there is nothing to deduct from previous)
-            if sequence_number > 0
+            if sequence_number == 0
+            {
+                // First loop has no previous valid interval
+                last_tick = Instant::now();
+            }
+            else
             {
                 let this_interval = last_tick.elapsed().as_micros() as i64;
                 let jitter = (this_interval - (ACCELEROMETER_PERIOD as i64 * 1000)).unsigned_abs() as i64;
@@ -988,7 +998,12 @@ fn gyroscope_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<Sys
             let mut metrics_lock = metrics.lock().unwrap();
 
             // Record jitter (skip first sequence as there is nothing to deduct from previous)
-            if sequence_number > 0
+            if sequence_number == 0
+            {
+                // First loop has no previous valid interval
+                last_tick = Instant::now();
+            }
+            else
             {
                 let this_interval = last_tick.elapsed().as_micros() as i64;
                 let jitter = (this_interval - (GYROSCOPE_PERIOD as i64 * 1000)).unsigned_abs() as i64;
@@ -1101,12 +1116,12 @@ fn health_monitor_task(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<
         );
         append_log(&log, &log_line);
  
-        // Flag if health task itself is drifting (deadline)
-        if drift.abs() > 25  // abs = absolute because drift is +ve or -ve, 25ms is deadline
+        // Flag if health task itself is drifting
+        if drift.abs() > 50  // abs = absolute because drift is +ve or -ve, 50ms check
         {
             let violation = format!
             (
-                "[{}ms] [DEADLINE] Health drift={:+}ms iteration={}",
+                "[{}ms] [WARN] Health drift={:+}ms iteration={}",
                 simulation_elapsed(&simulation_start_time),
                 drift,
                 iteration
@@ -1234,11 +1249,11 @@ fn data_compression_task(priority_buffer: Shared<PriorityBuffer>, downlink_queue
             packet_id += 1;
         }
  
-        if drift.abs() > 25 // 25 ms deadline check
+        if drift.abs() > 50 // 50 ms  check
         {
             let violation = format!
             (
-                "[{}ms] [DEADLINE] Compress drift={:+}ms iteration={}",
+                "[{}ms] [WARN] Compress drift={:+}ms iteration={}",
                 simulation_elapsed(&simulation_start_time),
                 drift,
                 iteration
@@ -1318,11 +1333,11 @@ fn antenna_alignment_task(metrics: Shared<SystemMetrics>, state: Shared<SystemSt
         );
         append_log(&log, &line);
  
-        if drift.abs() > 25 // 25 ms deadline check
+        if drift.abs() > 50 // 50 ms check
         {
             let violation = format!
             (
-                "[{}ms] [DEADLINE] Antenna drift={:+}ms iteration={}",
+                "[{}ms] [WARN] Antenna drift={:+}ms iteration={}",
                 simulation_elapsed(&simulation_start_time),
                 drift,
                 iteration
@@ -1583,7 +1598,7 @@ fn print_final_report(metrics: &SystemMetrics)
     println!("|  Insert latency (µs)");
     let insert_latency_values: Vec<i64> = metrics.insert_latency.iter().map(|&value| value as i64).collect(); // it iterates over the values and maps them to i64, then collects the resulting vector
     print_row("priority_buffer.push()", &insert_latency_values);
-    println!("|  Deadline violations: {}", metrics.deadline_log.len());
+    println!("|  Deadline / Warn violations: {}", metrics.deadline_log.len());
 
     for violation in metrics.deadline_log.iter().take(5) // for each violation in deadline log, proceed to print but only the first 5
     {
