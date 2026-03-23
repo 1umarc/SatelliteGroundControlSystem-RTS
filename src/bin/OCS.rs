@@ -173,7 +173,7 @@ impl Eq for SensorReading {}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DataPacket
 {
-    packetID: u64,
+    packet_id: u64,
     payload: String,     // serde_json of sensor readings
     created_at: u64,     // (ms) simulation time when packet was queued
     size_bytes: usize,
@@ -219,7 +219,7 @@ impl Radio<Idle>
         let initialisation_start_time = Instant::now();
         thread::sleep(Duration::from_millis(3));            // simulate hardware initialisation delay
  
-        let INITIALISE_TIME_LIMIT = initialisation_start_time.elapsed().as_millis() as u64;
+        let initialisation_duration = initialisation_start_time.elapsed().as_millis() as u64;
  
         if initialisation_duration > INITIALISE_TIME_LIMIT
         {
@@ -292,7 +292,7 @@ impl Radio<Transmitting>
             (
                 "[{}ms] [DOWNLINK] Transmit packet={}  {}bytes queue_latency={}ms",
                 simulation_elapsed(simulation_start_time),
-                packet.packetID,
+                packet.packet_id,
                 packet.size_bytes,
                 queue_latency
             );
@@ -304,7 +304,7 @@ impl Radio<Transmitting>
                 udp_sender,
                 OCSMessage::Downlink
                 {
-                    packet: packet.packetID,
+                    packet: packet.packet_id,
                     bytes: packet.size_bytes,
                     queue_latency: queue_latency,
                 }
@@ -442,45 +442,39 @@ impl PriorityBuffer
 // 6.1 Creates a Shared Arc<Mutex<T>> as repeats many times, (Arc - Atomic Reference Count) = to allow multiple owners, Mutex = thread-safe
 type Shared<T> = Arc<Mutex<T>>;
 
-// 6.2 Converts an OCSMessage to a JSON string
-fn encode_message(message: &OCSMessage) -> String 
-{
-    serde_json::to_string(message).unwrap_or_default()
-} //XXX: to be removed
- 
-// 6.3 Returns current simulation time from start time
+// 6.2 Returns current simulation time from start time
 fn simulation_elapsed(simulation_start_time: &Instant) -> u64
 {
     simulation_start_time.elapsed().as_millis() as u64
 }
  
-// 6.4 Boolean helper to determine if system is running
+// 6.3 Boolean helper to determine if system is running
 fn is_running(running: &Shared<bool>) -> bool
 {
     *running.lock().unwrap()
 }
  
-// 6.5 Serialise and send a typed OCSMessage through the UDP sender channel
+// 6.4 Serialise and send a typed OCSMessage through the UDP sender channel
 fn send_ocs_message(udp_sender: &mpsc::Sender<String>, message: OCSMessage)
 {
-    let encoded_message = serde_json::to_string(message).unwrap_or_default();
+    let encoded_message = serde_json::to_string(&message).unwrap_or_default();   // Converts OCSMessage to a JSON string
     let _ = udp_sender.send(encoded_message);  // _ = unused variable, following warning provided
 }
  
-// 6.6 Append deadline violation into metrics
+// 6.5 Append deadline violation into metrics
 fn append_deadline(metrics: &Shared<SystemMetrics>, violation: String)
 {
     metrics.lock().unwrap().deadline_log.push(violation);
 }
  
-// 6.7 Calculate scheduling drift
+// 6.6 Calculate scheduling drift
 fn calculate_drift(simulation_start_time: &Instant, expected_elapsed: u64) -> i64
 {
     let actual_elapsed = simulation_elapsed(simulation_start_time);
     actual_elapsed as i64 - expected_elapsed as i64
 }
  
-// 6.8 Push a sensor reading into the buffer and record metrics
+// 6.7 Push a sensor reading into the buffer and record metrics
 fn push_record_metrics(priority_buffer: &Shared<PriorityBuffer>, metrics: &Shared<SystemMetrics>, sensor_reading: SensorReading, drift: i64) -> (bool, u64)
 {
     // Measure buffer insert latency
@@ -503,21 +497,21 @@ fn push_record_metrics(priority_buffer: &Shared<PriorityBuffer>, metrics: &Share
     (accepted, insert_latency) // return tuple
 }
  
-// 6.9 Append log line to the log file only
+// 6.8 Append log line to the log file only
 fn append_log(log: &Shared<File>, line: &str)
 {
     let mut log_file = log.lock().unwrap();
     let _ = writeln!(log_file, "{line}");  // _ needed to handle Result, handling warning
 }
  
-// 6.10 Append important log line to console and log file
+// 6.9 Append important log line to console and log file
 fn append_console_log(log: &Shared<File>, line: &str)
 {
     println!("{line}");
     append_log(log, line);
 }
  
-// 6.11 Print a single row in the metrics report table
+// 6.10 Print a single row in the metrics report table
 fn print_row(label: &str, samples: &[i64])
 {
     if samples.is_empty()
@@ -562,7 +556,7 @@ fn udp_sender_thread(udp_receiver: mpsc::Receiver<String>, log: Shared<File>, si
         "[{}ms] [OCS-UDP] Ready -> {}",
         simulation_elapsed(&simulation_start_time),
         GCS_TELEMETRY_ADDRESS
-    )
+    );
     append_log(&log, &log_line);
  
     // for msg in Receiver, the loop ends when all senders are dropped
@@ -603,7 +597,7 @@ fn command_receiver_thread(running: Shared<bool>, log: Shared<File>, simulation_
         "[{}ms] [OCS-UDP] Listening on {}",
         simulation_elapsed(&simulation_start_time),
         OCS_COMMAND_ADDRESS
-    )
+    );
     append_console_log(&log, &log_line);
  
     let mut receive_buffer = [0u8; 4096]; // buffer for incoming packets, 0u8 = unsigned 8-bit integer, 4096 bytes
@@ -626,8 +620,8 @@ fn command_receiver_thread(running: Shared<bool>, log: Shared<File>, simulation_
                             "[{}ms] [OCS-UDP] {} -> command=\"{}\"  timestamp={}",
                             simulation_elapsed(&simulation_start_time),
                             source_address,
-                            command.cmd,
-                            command.ts
+                            command.command,
+                            command.timestamp
                         );
                         append_log(&log, &line);
                     }
@@ -715,7 +709,7 @@ fn thermal_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<Syste
         };
         
         // Push the sensor reading to the buffer
-        let (accepted,) = push_record_metrics(&priority_buffer, &metrics, sensor_reading, drift);
+        let (accepted, _) = push_record_metrics(&priority_buffer, &metrics, sensor_reading, drift); // _ = insert_latency, not used here
         {
             let mut metrics_lock = metrics.lock().unwrap();
  
@@ -741,7 +735,7 @@ fn thermal_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<Syste
             }
  
             // Check and act for 3 consecutive misses requirement
-            if (accepted)
+            if accepted       // no bracket due to warning
             {
                 metrics_lock.thermal_misses = 0;
             }
@@ -862,7 +856,7 @@ fn accelerometer_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared
         };
         
         // Push the sensor reading to the buffer
-        let (accepted,) = push_record_metrics(&priority_buffer, &metrics, sensor_reading, drift);
+        let (accepted, _) = push_record_metrics(&priority_buffer, &metrics, sensor_reading, drift);
         {
             let mut metrics_lock = metrics.lock().unwrap();
 
@@ -955,7 +949,7 @@ fn gyroscope_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<Sys
         };
         
         // Push the sensor reading to the buffer
-        let (accepted,) = push_record_metrics(&priority_buffer, &metrics, sensor_reading, drift);
+        let (accepted, _) = push_record_metrics(&priority_buffer, &metrics, sensor_reading, drift);
         {
             let mut metrics_lock = metrics.lock().unwrap();
 
@@ -1094,7 +1088,7 @@ fn health_monitor_task(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<
 // Drains up to 20 readings from the priority buffer, compresses with 50% size reduction, enqueues a DataPacket for downlink
 fn data_compression_task(priority_buffer: Shared<PriorityBuffer>, downlink_queue: Shared<Vec<DataPacket>>, metrics: Shared<SystemMetrics>, running: Shared<bool>, log: Shared<File>, simulation_start_time: Instant) -> impl FnMut() + Send + 'static
 {
-    let mut packetID: u64 = 0;
+    let mut packet_id: u64 = 0;
     let mut iteration: u64 = 0;
  
     move ||
@@ -1115,7 +1109,7 @@ fn data_compression_task(priority_buffer: Shared<PriorityBuffer>, downlink_queue
         {
             let mut buffer_lock = priority_buffer.lock().unwrap();
  
-            for i in 0..20
+            for _ in 0..20  // _ = throw away variable as warning
             {
                 match buffer_lock.pop()
                 {
@@ -1139,7 +1133,7 @@ fn data_compression_task(priority_buffer: Shared<PriorityBuffer>, downlink_queue
  
             let payload = serde_json::json! // previous maps array to json
             ({
-                "packetID": packetID,
+                "packet_id": packet_id,
                 "reading_count": sensor_batch.len(),
                 "created_at": simulation_elapsed(&simulation_start_time),
                 "data": data_array,
@@ -1152,7 +1146,7 @@ fn data_compression_task(priority_buffer: Shared<PriorityBuffer>, downlink_queue
             let queue_insert_start_time = Instant::now();
             downlink_queue.lock().unwrap().push(DataPacket
             {
-                packetID,
+                packet_id,
                 payload: payload,
                 created_at: simulation_elapsed(&simulation_start_time),
                 size_bytes: compressed_size_bytes,
@@ -1164,7 +1158,7 @@ fn data_compression_task(priority_buffer: Shared<PriorityBuffer>, downlink_queue
             (
                 "[{}ms] [OCS-Compress] packet={}  n={}  {}bytes   queue_insert latency={}µs  drift={:+}ms",
                 simulation_elapsed(&simulation_start_time),
-                packetID,
+                packet_id,
                 sensor_batch.len(),
                 compressed_size_bytes,
                 queue_insert_latency,
@@ -1172,7 +1166,7 @@ fn data_compression_task(priority_buffer: Shared<PriorityBuffer>, downlink_queue
             );
             append_log(&log, &line);
  
-            packetID += 1;
+            packet_id += 1;
         }
  
         if drift.abs() > 10 // 10 ms deadline check
@@ -1216,7 +1210,7 @@ fn antenna_alignment_task(metrics: Shared<SystemMetrics>, state: Shared<SystemSt
         }
  
         // Preemption check: skip if emergency or abort
-        if (*emergency.lock().unwrap() || *state.lock().unwrap() == SystemState::MissionAbort)
+        if *emergency.lock().unwrap() || *state.lock().unwrap() == SystemState::MissionAbort
         {
             // Append to console, log and deadline (metrics)
             let log_line = format!
@@ -1420,7 +1414,7 @@ fn fault_injector_thread(metrics: Shared<SystemMetrics>, state: Shared<SystemSta
         {
             // Update metrics
             let mut metrics_lock = metrics.lock().unwrap();
-            metrics_lock.fault_log.push(fault_message);
+            metrics_lock.fault_log.push(fault_line);
         }
 
         // Send a typed alert to GCS, using serde
@@ -1646,7 +1640,7 @@ fn main()
         let running = Arc::clone(&shared_running_flag);
         let logger = Arc::clone(&log);
         let start = simulation_start_time;
-        move || accelerometer_thread(buffer, metrics, transmit, running, logger, start)
+        move || accelerometer_thread(buffer, metrics, state, transmit, running, logger, start)
     }));
 
     // SENSOR 3: Gyroscope thread
@@ -1659,7 +1653,7 @@ fn main()
         let running = Arc::clone(&shared_running_flag);
         let logger = Arc::clone(&log);
         let start = simulation_start_time;
-        move || gyroscope_thread(buffer, metrics, transmit, running, logger, start)
+        move || gyroscope_thread(buffer, metrics, state, transmit, running, logger, start)
     }));
 
     // ScheduledThreadPool for 3 Rate Monotonic Tasks
@@ -1721,7 +1715,7 @@ fn main()
         let running = Arc::clone(&shared_running_flag);
         let logger = Arc::clone(&log);
         let start = simulation_start_time;
-        move || downlink_thread(dq, metrics, state, transmit, running, logger, start)
+        move || downlink_thread(downlink_queue, metrics, state, transmit, running, logger, start)
     }));
 
     // Fault injector thread
@@ -1729,12 +1723,11 @@ fn main()
     ({
         let metrics = Arc::clone(&shared_system_metrics);
         let state = Arc::clone(&shared_system_state);
-        let emergency = Arc::clone(&shared_emergency_flag);
         let transmit = telemetry_sender.clone();
         let running = Arc::clone(&shared_running_flag);
         let logger = Arc::clone(&log);
         let start = simulation_start_time;
-        move || fault_injector_thread(metrics, state, emergency, transmit, running, logger, start)
+        move || fault_injector_thread(metrics, state, transmit, running, logger, start)
     }));
 
     // Drop the final sender so udp_sender_thread can exit cleanly
