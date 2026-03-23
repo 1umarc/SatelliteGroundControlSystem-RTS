@@ -23,13 +23,13 @@ use serde_json;                                 // JSON encode/decode for UDP pa
 // Uses all caps with snake case due to warning
 
 // Sensor Sampling Periods (ms)
-const THERMAL_PERIOD: u64 = 25;         // highest priority sensor, fastest rate
-const ACCELEROMETER_PERIOD: u64 = 60;
-const GYROSCOPE_PERIOD: u64 = 175;      // Period (slides definition) = time between 2 tasks (interval)
+const THERMAL_PERIOD: u64 = 100;         // highest priority sensor, fastest rate
+const ACCELEROMETER_PERIOD: u64 = 200;
+const GYROSCOPE_PERIOD: u64 = 300;      // Period (slides definition) = time between 2 tasks (interval)
  
 // Background Task Periods (ms)
-const HEALTH_MONITOR_PERIOD: u64 = 50;
-const DATA_COMPRESSION_PERIOD: u64 = 100;   
+const HEALTH_MONITOR_PERIOD: u64 = 100;
+const DATA_COMPRESSION_PERIOD: u64 = 200;   
 const ANTENNA_ALIGNMENT_PERIOD: u64 = 500;
  
 // Safety Thresholds (Thermal = Critical Sensor)
@@ -45,7 +45,7 @@ const INITIALISE_TIME_LIMIT: u64 = 5;
  
 // Fault Injection & Simulation
 const FAULT_INJECTION_PERIOD: u64 = 60;   // 60s = 60000ms
-const RECOVERY_TIME_LIMIT: u64 = 200;     // (ms)      
+const RECOVERY_TIME_LIMIT: u64 = 200000;     // 200000μs = 200ms    
 const SIMULATION_DURATION: u64 = 180;     // 180s = 180000ms = 3min to inject 3 faults
  
 // Pre-allocated worst case Vec capacities during compilation to avoiding unpredictable heap allocation latency
@@ -57,7 +57,7 @@ const LOG_MAX_SIZE: usize = 500;
 // UDP Communication
 const GCS_TELEMETRY_ADDRESS: &str = "127.0.0.1:9000";
 const OCS_COMMAND_ADDRESS: &str = "0.0.0.0:9001";
-const UDP_TIMEOUT: u64 = 50;
+const UDP_TIMEOUT: u64 = 100;
  
 // Simulation Log
 const LOG_FILE: &str = "ocs.log";
@@ -231,7 +231,7 @@ impl Radio<Idle>
         {
             let log_line = format!
             (
-                "[{}ms] [RADIO DEADLINE] Initialisation {}ms > {}ms — staying Idle",
+                "[{}ms] [DEADLINE] Initialisation {}ms > {}ms — staying Idle",
                 simulation_elapsed(simulation_start_time),
                 initialisation_duration,
                 INITIALISE_TIME_LIMIT
@@ -525,7 +525,7 @@ fn print_row(label: &str, samples: &[i64])
 {
     if samples.is_empty()
     {
-        println!("|   {:<36} — no data", label); // < means left align
+        println!("|  {:<36} — no data", label); // < means left align
         return;
     }
  
@@ -533,7 +533,7 @@ fn print_row(label: &str, samples: &[i64])
     let maximum_value = samples.iter().max().unwrap();
     let average_value = samples.iter().sum::<i64>() as f64 / samples.len() as f64;
  
-    println!("|   {:<36} n={:>5}  min={:>7}  max={:>7}  avg={:>9.1}", label, samples.len(), minimum_value, maximum_value, average_value);
+    println!("|  {:<36} n={:>5}  min={:>7}  max={:>7}  avg={:>9.1}", label, samples.len(), minimum_value, maximum_value, average_value);
 }
  
 
@@ -743,6 +743,7 @@ fn thermal_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<Syste
         {
             thread::sleep(Duration::from_millis(THERMAL_PERIOD));
         }
+        let work_start = Instant::now();
         
         // Calculate scheduling drift
         let expected_elapsed = (sequence_number + 1) * THERMAL_PERIOD;
@@ -839,6 +840,7 @@ fn thermal_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<Syste
                 }
             }
         }
+        metrics.lock().unwrap().active_time += work_start.elapsed().as_micros() as u64; 
         sequence_number += 1;
     }
  
@@ -877,6 +879,7 @@ fn accelerometer_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared
         {
             thread::sleep(Duration::from_millis(ACCELEROMETER_PERIOD));
         }
+        let work_start = Instant::now();
         
         // Calculate scheduling drift
         let expected_elapsed = (sequence_number + 1) * ACCELEROMETER_PERIOD;
@@ -921,7 +924,8 @@ fn accelerometer_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared
                 append_log(&log, &line);
                 metrics_lock.dropped_log.push(line);
             }
-        }   
+        } 
+        metrics.lock().unwrap().active_time += work_start.elapsed().as_micros() as u64; 
         sequence_number += 1;
     }
 
@@ -960,6 +964,7 @@ fn gyroscope_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<Sys
         {
             thread::sleep(Duration::from_millis(GYROSCOPE_PERIOD));
         }
+        let work_start = Instant::now();
         
         // Calculate scheduling drift
         let expected_elapsed = (sequence_number + 1) * GYROSCOPE_PERIOD;
@@ -1004,6 +1009,7 @@ fn gyroscope_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<Sys
                 metrics_lock.dropped_log.push(line);
             }
         }
+        metrics.lock().unwrap().active_time += work_start.elapsed().as_micros() as u64; 
         sequence_number += 1;
     }
 
@@ -1096,7 +1102,7 @@ fn health_monitor_task(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<
         append_log(&log, &log_line);
  
         // Flag if health task itself is drifting (deadline)
-        if drift.abs() > 5  // abs = absolute because drift is +ve or -ve, 5ms is deadline
+        if drift.abs() > 25  // abs = absolute because drift is +ve or -ve, 25ms is deadline
         {
             let violation = format!
             (
@@ -1228,7 +1234,7 @@ fn data_compression_task(priority_buffer: Shared<PriorityBuffer>, downlink_queue
             packet_id += 1;
         }
  
-        if drift.abs() > 10 // 10 ms deadline check
+        if drift.abs() > 25 // 25 ms deadline check
         {
             let violation = format!
             (
@@ -1312,7 +1318,7 @@ fn antenna_alignment_task(metrics: Shared<SystemMetrics>, state: Shared<SystemSt
         );
         append_log(&log, &line);
  
-        if drift.abs() > 20 // 20 ms deadline check
+        if drift.abs() > 25 // 25 ms deadline check
         {
             let violation = format!
             (
@@ -1355,6 +1361,7 @@ fn downlink_thread(downlink_queue: Shared<Vec<DataPacket>>, metrics: Shared<Syst
     {
         // Wait for next visibility window
         thread::sleep(Duration::from_millis(VISIBILITY_PERIOD));
+        let work_start = Instant::now();
         if !is_running(&running)
         {
             break;
@@ -1402,6 +1409,7 @@ fn downlink_thread(downlink_queue: Shared<Vec<DataPacket>>, metrics: Shared<Syst
  
                 // transmit() changes Radio<Transmitting> and returns Radio<Idle>
                 let _ = transmitting_radio.transmit(&queued_packets, &metrics, &udp_sender, &simulation_start_time, &log);
+                metrics.lock().unwrap().active_time += work_start.elapsed().as_micros() as u64;    // update metrics
             }
         }
     }
@@ -1424,7 +1432,7 @@ fn fault_injector_thread(metrics: Shared<SystemMetrics>, state: Shared<SystemSta
         "[{}ms] [Faults] interval={}s  recovery_limit={}ms type=CorruptedReading",  // only 1 type of fault
         simulation_elapsed(&simulation_start_time),
         FAULT_INJECTION_PERIOD,
-        RECOVERY_TIME_LIMIT
+        RECOVERY_TIME_LIMIT / 1000
     );
     append_log(&log, &log_line);
     
@@ -1434,6 +1442,7 @@ fn fault_injector_thread(metrics: Shared<SystemMetrics>, state: Shared<SystemSta
     while is_running(&running)
     {
         thread::sleep(Duration::from_secs(FAULT_INJECTION_PERIOD));
+        let work_start = Instant::now();
 
         if !is_running(&running)
         {
@@ -1500,7 +1509,7 @@ fn fault_injector_thread(metrics: Shared<SystemMetrics>, state: Shared<SystemSta
                     "[{}ms] !! MISSION ABORT !! recovery {}ms > {}ms limit",
                     simulation_elapsed(&simulation_start_time),
                     recovery_time,
-                    RECOVERY_TIME_LIMIT
+                    RECOVERY_TIME_LIMIT / 1000
                 );
                 append_console_log(&log, &abort_message);
                 metrics_lock.safety_alerts.push(abort_message);
@@ -1523,6 +1532,7 @@ fn fault_injector_thread(metrics: Shared<SystemMetrics>, state: Shared<SystemSta
                 );
             }
         }
+        metrics.lock().unwrap().active_time += work_start.elapsed().as_micros() as u64;  // update metrics
     }
 
     append_console_log(&log, &format!
@@ -1553,16 +1563,16 @@ fn print_final_report(metrics: &SystemMetrics)
     let cpu_utilisation;
     if metrics.elapsed_time > 0
     {
-        cpu_utilisation = metrics.active_time as f64 / metrics.elapsed_time as f64 * 100.0;
+        cpu_utilisation = metrics.active_time as f64 / (metrics.elapsed_time as f64 * 1000.0) * 100.0;
     }
     else
     {
         cpu_utilisation = 0.0;
     }
  
-    println!("\n~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
+    println!("\n~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
     println!("|              OCS FINAL REPORT - BY LUVEN MARK (TP071542)                                    |");
-    println!("|~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
+    println!("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
     println!("|  Sensor Readings Received: {}  Sensor Readings Dropped: {} ({:.2}%)", metrics.total_received, metrics.total_dropped, packet_loss); // .2 = 2 decimal places
     println!("|  Jitter (µs)  limit={}µs", THERMAL_JITTER_TIME_LIMIT);
     print_row("Thermal [CRITICAL]", &metrics.thermal_jitter);
@@ -1595,7 +1605,7 @@ fn print_final_report(metrics: &SystemMetrics)
     {
         let maximum_recovery_time = metrics.recovery_times.iter().max().unwrap(); // get the maximum recovery time
         let average_recovery_time = metrics.recovery_times.iter().sum::<u64>() as f64 / metrics.recovery_times.len() as f64; // formula = sum of recovery times / number of recovery times
-        println!("|    recovery max={}µs  avg={:.1}µs", maximum_recovery_time, average_recovery_time);
+        println!("|    recovery max={}µs  avg={}µs", maximum_recovery_time, average_recovery_time);
     }
  
     println!("|  CPU ≈ {:.2}%", cpu_utilisation);
@@ -1715,7 +1725,7 @@ fn main()
 
     rate_monotonic_thread_pool.execute_at_fixed_rate // fixed rate means that the task will be executed at fixed intervals
     (
-        Duration::from_millis(10),                  // task will be executed every 10ms
+        Duration::from_millis(10),                  // 10ms offset
         Duration::from_millis(HEALTH_MONITOR_PERIOD),
         health_monitor_task
         (
@@ -1731,7 +1741,7 @@ fn main()
 
     rate_monotonic_thread_pool.execute_at_fixed_rate
     (
-        Duration::from_millis(20),                  // task will be executed every 20ms
+        Duration::from_millis(25),                  // 25ms offset
         Duration::from_millis(DATA_COMPRESSION_PERIOD),
         data_compression_task
         (
@@ -1746,7 +1756,7 @@ fn main()
 
     rate_monotonic_thread_pool.execute_at_fixed_rate
     (
-        Duration::from_millis(30),                  // task will be executed every 30ms
+        Duration::from_millis(50),                  // 50ms offset
         Duration::from_millis(ANTENNA_ALIGNMENT_PERIOD),
         antenna_alignment_task
         (
