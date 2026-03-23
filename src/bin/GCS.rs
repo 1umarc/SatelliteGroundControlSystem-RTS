@@ -1,5 +1,5 @@
 // GROUND CONTROL STATION - BY CHONG CHUN KIT (TP077436)
-// TYPE: SOFT RTS, demonstrating the learnt SOFT RTS concepts
+// TYPE: SOFT RTS, demonstrating the learnt Soft RTS concepts
 
 // Standard library stuff we need
 use std::fs::{File, OpenOptions};           // for creating and writing to the log file
@@ -22,9 +22,9 @@ use serde_json;                             // the actual JSON encoding/decoding
 // Rate Monotonic Command Periods (milliseconds)
 // Use all caps for constants to follow snake_case
 // Shorter period = higher priority under Rate Monotonic scheduling
-const THERMAL_COMMAND_PERIOD: u64 = 50;   // RM Priority 1 — fastest, so highest priority
-const ACCELEROMETER_COMMAND_PERIOD: u64 = 120;  // RM Priority 2
-const GYROSCOPE_COMMAND_PERIOD: u64 = 333;  // RM Priority 3 — slowest, so lowest priority
+const THERMAL_COMMAND_PERIOD: u64 = 25;   // RM Priority 1 — fastest, so highest priority
+const ACCELEROMETER_COMMAND_PERIOD: u64 = 60;  // RM Priority 2
+const GYROSCOPE_COMMAND_PERIOD: u64 = 175;  // RM Priority 3 — slowest, so lowest priority
 
 // Deadline limits from the assignment spec
 const DECODE_DEADLINE: u64 = 3;    // telemetry must be decoded within 3ms
@@ -35,8 +35,8 @@ const FAULT_RESPONSE_LIMIT: u64 = 100;  // interlock must engage within 100ms of
 const LOSS_OF_CONTACT_MISS_THRESHOLD: u32 = 3;
 // if we miss 3 or more packets in a row, we declare loss of contact
 
-const REREQUEST_INTERVAL: u64 = 500;
-// check for silence every 500ms — quick enough to notice, not so fast we spam requests
+const REREQUEST_INTERVAL: u64 = 250;
+// check for silence every 250ms — quick enough to notice, not so fast we spam requests
 
 // Jitter warning limit in microseconds
 const UPLINK_JITTER_LIMIT: i64 = 2000;
@@ -568,7 +568,11 @@ async fn telemetry_processor_task(mut receiver: mpsc::Receiver<IncomingPacket>, 
                         let mut gcs_state = state.lock().unwrap();
 
                         gcs_state.thermal_misses = 0;
+                        gcs_state.accelerometer_misses = 0;
+                        gcs_state.gyroscope_misses = 0;
                         gcs_state.last_thermal = simulation_elapsed(&simulation_start);
+                        gcs_state.last_accelerometer = simulation_elapsed(&simulation_start);
+                        gcs_state.last_gyroscope = simulation_elapsed(&simulation_start);
 
                         if gcs_state.loss_of_contact
                         {
@@ -802,7 +806,7 @@ async fn loss_of_contact_monitor_task(state: Shared<GCSState>, metrics: Shared<G
             {
                 let mut metric = metrics.lock().unwrap();
                 metric.critical_alerts.push(alert_message);
-                metric.missed_packets += max_miss_count as u64;
+                metric.missed_packets += 1;
             }
 
             {
@@ -924,8 +928,6 @@ async fn thermal_command_task(command_sender: mpsc::Sender<UplinkCommand>, state
 
     loop
     {
-        let loop_start = Instant::now();
-
         tokio::select!
         {
             _ = shutdown.cancelled() =>
@@ -935,6 +937,7 @@ async fn thermal_command_task(command_sender: mpsc::Sender<UplinkCommand>, state
             }
             _ = sleep(Duration::from_millis(THERMAL_COMMAND_PERIOD)) => {}
         }
+        let loop_start = Instant::now();
 
         // Drift: actual elapsed vs expected elapsed — positive means running late
         let expected_time = iteration * THERMAL_COMMAND_PERIOD;
@@ -1008,8 +1011,6 @@ async fn accelerometer_command_task(command_sender: mpsc::Sender<UplinkCommand>,
 
     loop
     {
-        let loop_start = Instant::now();
-
         tokio::select!
         {
             _ = shutdown.cancelled() =>
@@ -1019,6 +1020,7 @@ async fn accelerometer_command_task(command_sender: mpsc::Sender<UplinkCommand>,
             }
             _ = sleep(Duration::from_millis(ACCELEROMETER_COMMAND_PERIOD)) => {}
         }
+        let loop_start = Instant::now();
 
         // Drift: actual elapsed vs expected elapsed
         let expected_time = iteration * ACCELEROMETER_COMMAND_PERIOD;
@@ -1090,8 +1092,6 @@ async fn gyroscope_command_task(command_sender: mpsc::Sender<UplinkCommand>, sta
 
     loop
     {
-        let loop_start = Instant::now();
-
         tokio::select!
         {
             _ = shutdown.cancelled() =>
@@ -1101,6 +1101,7 @@ async fn gyroscope_command_task(command_sender: mpsc::Sender<UplinkCommand>, sta
             }
             _ = sleep(Duration::from_millis(GYROSCOPE_COMMAND_PERIOD)) => {}
         }
+        let loop_start = Instant::now();
 
         // Drift and jitter — same pattern as the other two RM tasks
         let expected_time = iteration * GYROSCOPE_COMMAND_PERIOD;
@@ -1254,7 +1255,7 @@ fn print_report(metric: &GCSMetrics, state: &GCSState, simulation_start: &Instan
     if !metric.interlock_latency.is_empty()
     {
         let interlock_samples: Vec<i64> = metric.interlock_latency.iter().map(|&v| v as i64).collect();
-        print_stat_row("Interlock latency (ms)", &interlock_samples);
+        print_stat_row("Interlock Latency (ms)", &interlock_samples);
     }
     println!("║  Deadline violations: {}", metric.deadline_violations.len());
     for violation in metric.deadline_violations.iter().take(3)

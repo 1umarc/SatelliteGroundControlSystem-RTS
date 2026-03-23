@@ -28,8 +28,8 @@ const ACCELEROMETER_PERIOD: u64 = 60;
 const GYROSCOPE_PERIOD: u64 = 175;      // Period (slides definition) = time between 2 tasks (interval)
  
 // Background Task Periods (ms)
-const HEALTH_MONITOR_PERIOD: u64 = 100;
-const DATA_COMPRESSION_PERIOD: u64 = 200;   
+const HEALTH_MONITOR_PERIOD: u64 = 50;
+const DATA_COMPRESSION_PERIOD: u64 = 100;   
 const ANTENNA_ALIGNMENT_PERIOD: u64 = 500;
  
 // Safety Thresholds (Thermal = Critical Sensor)
@@ -39,14 +39,14 @@ const PRIORITY_BUFFER: usize = 100;               // max items in the priority b
 const DEGRADED_MODE: f32 = 0.80;                  // degraded mode at 80% full
  
 // Downlink (ms)
-const VISIBILITY_PERIOD: u64 = 10000;        // 10000ms = 10s
+const VISIBILITY_PERIOD: u64 = 5000;        // 5000ms = 5s
 const DOWNLINK_TIME_LIMIT: u64 = 30;     
 const INITIALISE_TIME_LIMIT: u64 = 5;      
  
-// Fault Injection & Simulation (ms)
-const FAULT_INJECTION_PERIOD: u64 = 60000;   // 60000ms = 60s
-const RECOVERY_TIME_LIMIT: u64 = 200;       
-const SIMULATION_DURATION: u64 = 180000;     // 180000ms = 180s = 3min to inject 3 faults
+// Fault Injection & Simulation
+const FAULT_INJECTION_PERIOD: u64 = 60;   // 60s = 60000ms
+const RECOVERY_TIME_LIMIT: u64 = 200;     // (ms)      
+const SIMULATION_DURATION: u64 = 180;     // 180s = 180000ms = 3min to inject 3 faults
  
 // Pre-allocated worst case Vec capacities during compilation to avoiding unpredictable heap allocation latency
 const JITTER_MAX_SIZE: usize = 10000;
@@ -57,7 +57,7 @@ const LOG_MAX_SIZE: usize = 500;
 // UDP Communication
 const GCS_TELEMETRY_ADDRESS: &str = "127.0.0.1:9000";
 const OCS_COMMAND_ADDRESS: &str = "0.0.0.0:9001";
-const UDP_TIMEOUT: u64 = 100;
+const UDP_TIMEOUT: u64 = 50;
  
 // Simulation Log
 const LOG_FILE: &str = "ocs.log";
@@ -729,6 +729,7 @@ fn thermal_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<Syste
     append_log(&log, &log_line);
     
     let mut sequence_number: u64 = 0;
+    let mut last_tick: Instant = Instant::now();
  
     while is_running(&running)
     {
@@ -770,7 +771,9 @@ fn thermal_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<Syste
             if sequence_number > 0
             {
                 // Jitter uses microseconds for precision
-                let jitter = Duration::from_millis(drift.unsigned_abs()).as_micros() as i64;
+                let this_interval = last_tick.elapsed().as_micros() as i64;
+                let jitter = (this_interval - (THERMAL_PERIOD as i64 * 1000)).unsigned_abs() as i64;
+                last_tick = Instant::now();
                 metrics_lock.thermal_jitter.push(jitter);
  
                 if jitter > THERMAL_JITTER_TIME_LIMIT
@@ -860,6 +863,7 @@ fn accelerometer_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared
     append_log(&log, &log_line);
     
     let mut sequence_number: u64 = 0;
+    let mut last_tick: Instant = Instant::now();
 
     while is_running(&running)
     {
@@ -899,7 +903,9 @@ fn accelerometer_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared
             // Record jitter (skip first sequence as there is nothing to deduct from previous)
             if sequence_number > 0
             {
-                let jitter = Duration::from_millis(drift.unsigned_abs()).as_micros() as i64;
+                let this_interval = last_tick.elapsed().as_micros() as i64;
+                let jitter = (this_interval - (ACCELEROMETER_PERIOD as i64 * 1000)).unsigned_abs() as i64;
+                last_tick = Instant::now();
                 metrics_lock.accelerometer_jitter.push(jitter);
             }
 
@@ -940,6 +946,7 @@ fn gyroscope_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<Sys
     append_log(&log, &log_line);
     
     let mut sequence_number: u64 = 0;
+    let mut last_tick: Instant = Instant::now();
 
     while is_running(&running)
     {
@@ -978,7 +985,9 @@ fn gyroscope_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<Sys
             // Record jitter (skip first sequence as there is nothing to deduct from previous)
             if sequence_number > 0
             {
-                let jitter = Duration::from_millis(drift.unsigned_abs()).as_micros() as i64;
+                let this_interval = last_tick.elapsed().as_micros() as i64;
+                let jitter = (this_interval - (GYROSCOPE_PERIOD as i64 * 1000)).unsigned_abs() as i64;
+                last_tick = Instant::now();
                 metrics_lock.gyroscope_jitter.push(jitter);
             }
 
@@ -1424,7 +1433,7 @@ fn fault_injector_thread(metrics: Shared<SystemMetrics>, state: Shared<SystemSta
 
     while is_running(&running)
     {
-        thread::sleep(Duration::from_millis(FAULT_INJECTION_PERIOD));
+        thread::sleep(Duration::from_secs(FAULT_INJECTION_PERIOD));
 
         if !is_running(&running)
         {
@@ -1471,7 +1480,7 @@ fn fault_injector_thread(metrics: Shared<SystemMetrics>, state: Shared<SystemSta
         let recovery_start_time = Instant::now();
         thread::sleep(Duration::from_millis(50)); // simulate recovery, 50 ms
 
-        let recovery_time = recovery_start_time.elapsed().as_millis() as u64; // will be 50ms +- jitter
+        let recovery_time = recovery_start_time.elapsed().as_micros() as u64; // will be 50ms +- jitter
         let recovery_done_line = format!
         (
             "[{}ms] [Faults] Recovery in {}ms",
@@ -1527,7 +1536,7 @@ fn fault_injector_thread(metrics: Shared<SystemMetrics>, state: Shared<SystemSta
 
 // ~~~~ SECTION 5: FINAL METRICS REPORT ~~~~~
 // 18. ---- FINAL REPORT ----
-fn print_final_report(metrics: &SystemMetrics, simulation_end_time: u64)
+fn print_final_report(metrics: &SystemMetrics)
 {
     // Calculate packet loss percentage
     let packet_loss;
@@ -1551,10 +1560,10 @@ fn print_final_report(metrics: &SystemMetrics, simulation_end_time: u64)
         cpu_utilisation = 0.0;
     }
  
-    println!("\n~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
-    println!("|              OCS FINAL REPORT - BY LUVEN MARK (TP071542)             |");
-    println!("|~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
-    println!("|  Received: {}  Dropped: {} ({:.2}%)", metrics.total_received, metrics.total_dropped, packet_loss); // .2 = 2 decimal places
+    println!("\n~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
+    println!("|              OCS FINAL REPORT - BY LUVEN MARK (TP071542)                                    |");
+    println!("|~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
+    println!("|  Sensor Readings Received: {}  Sensor Readings Dropped: {} ({:.2}%)", metrics.total_received, metrics.total_dropped, packet_loss); // .2 = 2 decimal places
     println!("|  Jitter (µs)  limit={}µs", THERMAL_JITTER_TIME_LIMIT);
     print_row("Thermal [CRITICAL]", &metrics.thermal_jitter);
     print_row("Accelerometer", &metrics.accelerometer_jitter);
@@ -1586,7 +1595,7 @@ fn print_final_report(metrics: &SystemMetrics, simulation_end_time: u64)
     {
         let maximum_recovery_time = metrics.recovery_times.iter().max().unwrap(); // get the maximum recovery time
         let average_recovery_time = metrics.recovery_times.iter().sum::<u64>() as f64 / metrics.recovery_times.len() as f64; // formula = sum of recovery times / number of recovery times
-        println!("|    recovery max={}ms  avg={:.1}ms", maximum_recovery_time, average_recovery_time);
+        println!("|    recovery max={}µs  avg={:.1}µs", maximum_recovery_time, average_recovery_time);
     }
  
     println!("|  CPU ≈ {:.2}%", cpu_utilisation);
@@ -1599,7 +1608,7 @@ fn print_final_report(metrics: &SystemMetrics, simulation_end_time: u64)
             println!("|    {alert}"); // print each alert
         }
     }
-    println!("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n");
+    println!("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n");
 }
 
 
@@ -1623,7 +1632,7 @@ fn main()
     let shared_priority_buffer: Shared<PriorityBuffer> = Arc::new(Mutex::new(PriorityBuffer::new(PRIORITY_BUFFER)));
     let shared_system_metrics: Shared<SystemMetrics> = Arc::new(Mutex::new(SystemMetrics::new()));
     let shared_system_state: Shared<SystemState> = Arc::new(Mutex::new(SystemState::Normal));
-    let shared_downlink_queue: Shared<Vec<DataPacket>> = Arc::new(Mutex::new(Vec::<DataPacket>::with_capacity(50))); // 50 = 10,000ms / 200ms  (Visibility Window / Packet Period) = 50 packets 
+    let shared_downlink_queue: Shared<Vec<DataPacket>> = Arc::new(Mutex::new(Vec::<DataPacket>::with_capacity(25))); // 25 = 5,000ms / 200ms  (Visibility Window / Packet Period) = 25 packets 
     let shared_emergency_flag: Shared<bool> = Arc::new(Mutex::new(false));
     let shared_running_flag: Shared<bool> = Arc::new(Mutex::new(true));
 
@@ -1787,9 +1796,9 @@ fn main()
     append_log(&log, "[OCS] All OCS threads and RM tasks are online.");
 
     // Run for the Simulation Duration
-    thread::sleep(Duration::from_millis(SIMULATION_DURATION));
+    thread::sleep(Duration::from_secs(SIMULATION_DURATION));
 
-    // Own version of Graceful Shutdown (Hard RTS)
+    // Version of Graceful Shutdown with Running Flag (Hard RTS)
     println!("\n[OCS] Simulation ended — signalling shutdown...");
     append_log(&log, "[OCS] Simulation duration elapsed. Shutdown initiated.");
 
@@ -1809,8 +1818,7 @@ fn main()
     println!("\n[OCS] FINAL REPORT:");
     {   // Lock and print final report
         let metrics_lock = shared_system_metrics.lock().unwrap();
-        let end = simulation_elapsed(&simulation_start_time);
-        print_final_report(&metrics_lock, end);
+        print_final_report(&metrics_lock);
     }
 
     append_log(&log, "[OCS] Final report generated.");
