@@ -112,8 +112,18 @@ enum SensorType
     Accelerometer,
     Gyroscope,
 }
- 
-// One sensor measurement, timestamped and prioritised
+
+// System health state
+#[derive(Debug, Clone, PartialEq)]
+enum SystemState
+{
+    Normal,
+    Degraded,
+    MissionAbort,
+}
+  
+
+// Process 1 (RAW): Reading off the sensor
 #[derive(Debug, Clone)]
 struct SensorReading
 {
@@ -151,25 +161,19 @@ impl PartialEq for SensorReading
     }
 }
 impl Eq for SensorReading {}
- 
-// Compressed packet ready for downlink transmission
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct DataPacket   
-{
-    packet_id: u64,
-    payload: String,     // serde_json of sensor readings
-    created_at: u64,     // (ms) simulation time when packet was queued
-    size_bytes: usize,
-} 
 
+// Process 2 (COMPRESSION): Serialisable, drops priority, converts SensorType to a plain String so it can be JSON-encoded
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct CompressedReading
 {
     sensor_type: String,
+    sequence: u64,
     value: f64,
+    drift: i64,
     timestamp: u64,
 }
 
+// Process 3 (PACKETIZATION): Batch of CompressedReadings with packet-level metadata (packet_id, created_at)
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct CompressedPayload
 {
@@ -178,18 +182,20 @@ struct CompressedPayload
     created_at: u64,
     readings: Vec<CompressedReading>,
 }
- 
-// System health state
-#[derive(Debug, Clone, PartialEq)]
-enum SystemState
-{
-    Normal,
-    Degraded,
-    MissionAbort,
-}
-  
 
-// 3. ---- TYPESTATES - for Radio (Downlink Thread) ----
+// Process 4 (QUEUING): Queue entry, holding JSON payload, sits in the downlink queue and gets measured for queue latency
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DataPacket   
+{
+    packet_id: u64,
+    reading_count: usize,
+    payload: String,     // serde_json of sensor readings
+    created_at: u64,     // (ms) simulation time when packet was queued
+    size_bytes: usize,
+} 
+ 
+
+// 3. ---- TYPESTATE - for Radio (Downlink Thread) ----
 // With typestates, calling .transmit() when Idle is a compile error, enforcing state machine at compile time, not runtime
 
 // Two possible radio states
@@ -305,7 +311,7 @@ impl Radio<Transmitting>
                 udp_sender,
                 OCSMessage::Downlink
                 {
-                    packet: packet.packet_id,
+                    packet_id: packet.packet_id,
                     reading_count: packet.reading_count,
                     bytes: packet.size_bytes,
                     queue_latency: queue_latency,
@@ -325,7 +331,7 @@ impl Radio<Transmitting>
             total_transmitted_bytes,
             transmission_duration
         );
-        append_console_log(log, &log_line); //XXX: inform
+        append_console_log(log, &log_line);
  
         // Return the Idle state, caller now holds Radio<Idle>
         Radio
@@ -519,7 +525,7 @@ fn print_row(label: &str, samples: &[i64])
 {
     if samples.is_empty()
     {
-        println!("    {:<36} — no data", label); // < means left align
+        println!("|   {:<36} — no data", label); // < means left align
         return;
     }
  
@@ -527,7 +533,7 @@ fn print_row(label: &str, samples: &[i64])
     let maximum_value = samples.iter().max().unwrap();
     let average_value = samples.iter().sum::<i64>() as f64 / samples.len() as f64;
  
-    println!("    {:<36} n={:>5}  min={:>7}  max={:>7}  avg={:>9.1}", label, samples.len(), minimum_value, maximum_value, average_value);
+    println!("|   {:<36} n={:>5}  min={:>7}  max={:>7}  avg={:>9.1}", label, samples.len(), minimum_value, maximum_value, average_value);
 }
  
 
@@ -589,7 +595,7 @@ fn udp_sender_thread(udp_receiver: mpsc::Receiver<String>, log: Shared<File>, si
 
 // 9. ---- UDP RECEIVER ----
 // Receives commands from the GCS and executes them
-fn command_receiver_thread(running: Shared<bool>, log: Shared<File>, simulation_start_time: Instant)
+fn command_receiver_thread(running: Shared<bool>, emergency: Shared<bool>, log: Shared<File>, simulation_start_time: Instant)
 {
     // Bind to the GCS command port
     let socket = UdpSocket::bind(OCS_COMMAND_ADDRESS).expect("[OCS-UDP] bind failed");
@@ -618,8 +624,7 @@ fn command_receiver_thread(running: Shared<bool>, log: Shared<File>, simulation_
                 {
                     Ok(command) =>
                     {
-                        let line = format!
-                        (
+                        let line = format!(
                             "[{}ms] [OCS-UDP] {} -> command=\"{}\"  timestamp={}",
                             simulation_elapsed(&simulation_start_time),
                             source_address,
@@ -627,10 +632,52 @@ fn command_receiver_thread(running: Shared<bool>, log: Shared<File>, simulation_
                             command.timestamp
                         );
                         append_log(&log, &line);
+
+                        // Execute the commands received from the GCS
+                        match command.command.as_str()
+                        {
+                            "ThermalCheck" | "AccelerometerCheck" | "GyroscopeCheck" =>
+                            {   // GCS is asking sensor health — acknowledge in log (sensors run continuously)
+                                append_log(&log, &format!
+                                    (
+                                        "[{}ms] [OCS-UDP] {} acknowledged — sensor running normally",
+                                        simulation_elapsed(&simulation_start_time),
+                                        command.command
+                                    ));
+                            }
+                            "RetransmitRequest" =>
+                            {   // GCS lost contact — log it 
+                                append_console_log(&log, &format!
+                                    (
+                                        "[{}ms] [OCS-UDP] RetransmitRequest from GCS — loss of contact detected",
+                                        simulation_elapsed(&simulation_start_time)
+                                    ));
+                            }
+                            "EmergencyHalt" =>
+                            {   // GCS triggered emergency halt (example after MissionAbort alert)
+                                append_console_log(&log, &format!
+                                    (
+                                        "[{}ms] [OCS-UDP] EmergencyHalt received from GCS — initiating shutdown",
+                                        simulation_elapsed(&simulation_start_time)
+                                    ));
+                                *emergency.lock().unwrap() = true;
+                                *running.lock().unwrap()   = false;
+                            }
+                             _ => 
+                            {   // Catch-all for unknown commands to satisfy the compiler
+                                append_log(&log, &format!
+                                (
+                                    "[{}ms] [OCS-UDP] Unknown command \"{}\" — ignored",
+                                    simulation_elapsed(&simulation_start_time),
+                                    command.command
+                                ));
+                            }
+                        }
                     }
                     Err(_) =>
                     {
-                        let line = format!(
+                        let line = format!
+                        (
                             "[{}ms] [OCS-UDP] {} (unparsed): {}",
                             simulation_elapsed(&simulation_start_time),
                             source_address,
@@ -640,6 +687,7 @@ fn command_receiver_thread(running: Shared<bool>, log: Shared<File>, simulation_
                     }
                 }
             }
+
             // If WouldBlock / TimedOut happens
             Err(error)
                 if (error.kind() == std::io::ErrorKind::WouldBlock || error.kind() == std::io::ErrorKind::TimedOut) => 
@@ -670,7 +718,7 @@ fn command_receiver_thread(running: Shared<bool>, log: Shared<File>, simulation_
  
 // ~~~~ SECTION 1: Sensor Data Acquisition & Prioritization ~~~~~
 // 10. ---- THERMAL THREAD (CRITICAL SENSOR) ----
-fn thermal_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<SystemMetrics>, state: Shared<SystemState>, emergency: Shared<bool>, running: Shared<bool>, log: Shared<File>, simulation_start_time: Instant)
+fn thermal_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<SystemMetrics>, state: Shared<SystemState>, emergency: Shared<bool>, udp_sender: mpsc::Sender<String>, running: Shared<bool>, log: Shared<File>, simulation_start_time: Instant)
 {
     let log_line = format!
     (
@@ -700,13 +748,13 @@ fn thermal_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<Syste
         let drift = calculate_drift(&simulation_start_time, expected_elapsed);
  
         // Simulate a slowly rising temperature
-        let temperature: f64 = 22.0 + (sequence_number % 50) as f64 * 0.3; //XXX: FORMULA
+        let temperature: f64 = 20.0 + (sequence_number % 40) as f64; // rises, resets every 40 readings
  
         // Build the sensor reading with priority 1 (highest / most critical)
         let sensor_reading = SensorReading
         {
             sensor_type: SensorType::Thermal,
-            sequence_number: sequence_number,
+            sequence: sequence_number,
             value: temperature,
             drift,
             timestamp: simulation_elapsed(&simulation_start_time),
@@ -782,13 +830,12 @@ fn thermal_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<Syste
                             event: "thermal_alert".into(),
                             misses: Some(metrics_lock.thermal_misses as u32),
                             count: None,            // Not applicable for this fault
-                            fault_type: None,       // TODO: Optional
+                            fault_type: None,    
                         }
                     );
                 }
             }
         }
-        //XXX: purpose of command from gcs? change value
         sequence_number += 1;
     }
  
@@ -831,16 +878,13 @@ fn accelerometer_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared
         let expected_elapsed = (sequence_number + 1) * ACCELEROMETER_PERIOD;
         let drift = calculate_drift(&simulation_start_time, expected_elapsed);
 
-        let acceleration_x = (sequence_number as f64 * 0.05).sin() * 0.10;
-        let acceleration_y = (sequence_number as f64 * 0.07).cos() * 0.10;
-        let acceleration_z = 9.81 + (sequence_number as f64 * 0.03).sin() * 0.01;
-        let magnitude = (acceleration_x * acceleration_x + acceleration_y * acceleration_y + acceleration_z * acceleration_z).sqrt(); //XXX: FORMULA
+        let magnitude: f64 = 9.81 + (sequence_number % 10) as f64 * 0.05; // simulating small change
 
         // Build the sensor reading with priority 2
         let sensor_reading = SensorReading
         {
             sensor_type: SensorType::Accelerometer,
-            sequence_number: sequence_number,
+            sequence: sequence_number,
             value: magnitude,
             drift,   
             timestamp: simulation_elapsed(&simulation_start_time),
@@ -913,13 +957,13 @@ fn gyroscope_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<Sys
         // Calculate scheduling drift
         let expected_elapsed = (sequence_number + 1) * GYROSCOPE_PERIOD;
         let drift = calculate_drift(&simulation_start_time, expected_elapsed);
-        let orientation: f64 = 0.5 * (sequence_number as f64 * 0.10).sin(); //XXX: FORMULA
+        let orientation: f64 = (sequence_number % 360) as f64; // cycles full rotations
 
         // Build the sensor reading with priority 3 (lowest priority)
         let sensor_reading = SensorReading
         {
             sensor_type: SensorType::Gyroscope,
-            sequence_number: sequence_number,
+            sequence: sequence_number,
             value: orientation,
             drift,
             timestamp: simulation_elapsed(&simulation_start_time),
@@ -1081,8 +1125,8 @@ fn health_monitor_task(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<
         iteration += 1;
     }
 }
- 
-//XXX: overdo?
+
+
 // 14. ---- DATA COMPRESSION THREAD (Rate Monotonic P2) ----
 // Drains up to 20 readings from the priority buffer, compresses with 50% size reduction, enqueues a DataPacket for downlink
 fn data_compression_task(priority_buffer: Shared<PriorityBuffer>, downlink_queue: Shared<Vec<DataPacket>>, metrics: Shared<SystemMetrics>, running: Shared<bool>, log: Shared<File>, simulation_start_time: Instant) -> impl FnMut() + Send + 'static
@@ -1245,7 +1289,7 @@ fn antenna_alignment_task(metrics: Shared<SystemMetrics>, state: Shared<SystemSt
         let drift = calculate_drift(&simulation_start_time, expected_elapsed);
  
         // Compute angle and elevation for this iteration
-        let angle_degrees = (iteration as f64 * 7.2) % 360.0; //XXX: FORMULA
+        let angle_degrees = (iteration as f64 * 7.2) % 360.0; // full 360 degrees every 50 iterations
         let elevation_degrees = 30.0 + 20.0 * (iteration as f64 * 0.05).sin();
  
         let line = format!
@@ -1263,7 +1307,7 @@ fn antenna_alignment_task(metrics: Shared<SystemMetrics>, state: Shared<SystemSt
         {
             let violation = format!
             (
-                "[{}ms] [DEADLINE] Antenna drift={:+}ms iteration={}",  //TODO: + means
+                "[{}ms] [DEADLINE] Antenna drift={:+}ms iteration={}",
                 simulation_elapsed(&simulation_start_time),
                 drift,
                 iteration
@@ -1286,7 +1330,7 @@ fn antenna_alignment_task(metrics: Shared<SystemMetrics>, state: Shared<SystemSt
 
 // ~~~~ SECTION 3: Downlink Data Management ~~~~~
 // 16. ---- DOWNLINK THREAD ----
-fn downlink_thread(downlink_queue: Shared<Vec<DataPacket>>, metrics: Shared<SystemMetrics>, state: Shared<SystemState>, udp_sender: mpsc::Sender<String>, running: Shared<bool>, log: Shared<File>, simulation_start_time: Instant) 
+fn downlink_thread(downlink_queue: Shared<Vec<DataPacket>>, metrics: Shared<SystemMetrics>, udp_sender: mpsc::Sender<String>, running: Shared<bool>, log: Shared<File>, simulation_start_time: Instant) 
 {
     let log_line = format!
     (
@@ -1333,9 +1377,9 @@ fn downlink_thread(downlink_queue: Shared<Vec<DataPacket>>, metrics: Shared<Syst
  
             Some(transmitting_radio) =>
             {
-                // Drain all queued packets for transmission
+                // Drain the queue under a brief lock, releases it, then transmits, Hard RTS pattern of minimise lock hold time
                 let queued_packets: Vec<DataPacket> = downlink_queue.lock().unwrap().drain(..).collect(); // .. = all elements
-                //XXX: overdone
+
                 if queued_packets.is_empty()
                 {
                     let line = format!
@@ -1364,7 +1408,7 @@ fn downlink_thread(downlink_queue: Shared<Vec<DataPacket>>, metrics: Shared<Syst
 
 // ~~~~ SECTION 4: BENCHMARKING AND FAULT SIMULATION ~~~~~
 // 17. ---- FAULT INJECTOR ----
-fn fault_injector_thread(metrics: Shared<SystemMetrics>, state: Shared<SystemState>, udp_sender: mpsc::Sender<String>, running: Shared<bool>, log: Shared<File>, simulation_start_time: Instant,)
+fn fault_injector_thread(metrics: Shared<SystemMetrics>, state: Shared<SystemState>, emergency: Shared<bool>, udp_sender: mpsc::Sender<String>, running: Shared<bool>, log: Shared<File>, simulation_start_time: Instant)
 {
     let log_line = format!
     (
@@ -1427,11 +1471,11 @@ fn fault_injector_thread(metrics: Shared<SystemMetrics>, state: Shared<SystemSta
         let recovery_start_time = Instant::now();
         thread::sleep(Duration::from_millis(50)); // simulate recovery, 50 ms
 
-        let recovery_time = recovery_start_time.elapsed().as_millis() as u64;
+        let recovery_time = recovery_start_time.elapsed().as_millis() as u64; // will be 50ms +- jitter
         let recovery_done_line = format!
         (
             "[{}ms] [Faults] Recovery in {}ms",
-            simulation_elapsed(&simulation_start_time), // IFIXME: always 50?
+            simulation_elapsed(&simulation_start_time),
             recovery_time
         );
         append_console_log(&log, &recovery_done_line);
@@ -1444,14 +1488,30 @@ fn fault_injector_thread(metrics: Shared<SystemMetrics>, state: Shared<SystemSta
             {
                 let abort_message = format!
                 (
-                    "[{}ms] !! MISSION ABORT !! recovery {}ms",
+                    "[{}ms] !! MISSION ABORT !! recovery {}ms > {}ms limit",
                     simulation_elapsed(&simulation_start_time),
-                    recovery_time
-                ); //TODO: emergency lock?
-
+                    recovery_time,
+                    RECOVERY_TIME_LIMIT
+                );
                 append_console_log(&log, &abort_message);
                 metrics_lock.safety_alerts.push(abort_message);
+
+                // Set emergency so Antenna Alignment Task is preempted immediately
+                *emergency.lock().unwrap() = true;
                 *state.lock().unwrap() = SystemState::MissionAbort;
+
+                // Notify GCS so it can send EmergencyHalt back
+                send_ocs_message
+                (
+                    &udp_sender,
+                    OCSMessage::Alert
+                    {
+                        event: "mission_abort".into(),
+                        misses: None,
+                        count: Some(fault_count),
+                        fault_type: Some("RecoveryTimeout".into()),
+                    }
+                );
             }
         }
     }
@@ -1464,7 +1524,7 @@ fn fault_injector_thread(metrics: Shared<SystemMetrics>, state: Shared<SystemSta
     );
 }
  
-// XXX: append report to logs for submission?
+
 // ~~~~ SECTION 5: FINAL METRICS REPORT ~~~~~
 // 18. ---- FINAL REPORT ----
 fn print_final_report(metrics: &SystemMetrics, simulation_end_time: u64)
@@ -1491,55 +1551,55 @@ fn print_final_report(metrics: &SystemMetrics, simulation_end_time: u64)
         cpu_utilisation = 0.0;
     }
  
-    println!("\n╔══════════════════════════════════════════════════════════════════════╗");
-    println!("║  OCS FINAL REPORT  at {}ms", simulation_end_time);
-    println!("╠══════════════════════════════════════════════════════════════════════╣");
-    println!("║  Received: {}  Dropped: {} ({:.2}%)", metrics.total_received, metrics.total_dropped, packet_loss); // .2 = 2 decimal places
-    println!("║  Jitter (µs)  limit={}µs", THERMAL_JITTER_TIME_LIMIT);
+    println!("\n~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
+    println!("|              OCS FINAL REPORT - BY LUVEN MARK (TP071542)             |");
+    println!("|~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
+    println!("|  Received: {}  Dropped: {} ({:.2}%)", metrics.total_received, metrics.total_dropped, packet_loss); // .2 = 2 decimal places
+    println!("|  Jitter (µs)  limit={}µs", THERMAL_JITTER_TIME_LIMIT);
     print_row("Thermal [CRITICAL]", &metrics.thermal_jitter);
     print_row("Accelerometer", &metrics.accelerometer_jitter);
     print_row("Gyroscope", &metrics.gyroscope_jitter);
-    println!("║  Drift (ms)");
+    println!("|  Drift (ms)");
     print_row("All tasks", &metrics.drift);
-    println!("║  Insert latency (µs)");
+    println!("|  Insert latency (µs)");
     let insert_latency_values: Vec<i64> = metrics.insert_latency.iter().map(|&value| value as i64).collect(); // it iterates over the values and maps them to i64, then collects the resulting vector
     print_row("priority_buffer.push()", &insert_latency_values);
-    println!("║  Deadline violations: {}", metrics.deadline_log.len());
+    println!("|  Deadline violations: {}", metrics.deadline_log.len());
 
     for violation in metrics.deadline_log.iter().take(5) // for each violation in deadline log, proceed to print but only the first 5
     {
-        println!("║    {violation}");
+        println!("|    {violation}");
     }
     if metrics.deadline_log.len() > 5
     {
-        println!("║    ... and {} more", metrics.deadline_log.len() - 5 // print the number of violations minus the 5 already printed
+        println!("|    ... and {} more", metrics.deadline_log.len() - 5 // print the number of violations minus the 5 already printed
         );
     }
 
-    println!("║  Faults: {}", metrics.fault_log.len()); // print the number of faults
+    println!("|  Faults: {}", metrics.fault_log.len()); // print the number of faults
 
     for fault in &metrics.fault_log
     {
-        println!("║    {fault}"); // print each fault
+        println!("|    {fault}"); // print each fault
     }
     if !metrics.recovery_times.is_empty()
     {
         let maximum_recovery_time = metrics.recovery_times.iter().max().unwrap(); // get the maximum recovery time
         let average_recovery_time = metrics.recovery_times.iter().sum::<u64>() as f64 / metrics.recovery_times.len() as f64; // formula = sum of recovery times / number of recovery times
-        println!("║    recovery max={}ms  avg={:.1}ms", maximum_recovery_time, average_recovery_time);
+        println!("|    recovery max={}ms  avg={:.1}ms", maximum_recovery_time, average_recovery_time);
     }
  
-    println!("║  CPU ≈ {:.2}%", cpu_utilisation);
+    println!("|  CPU ≈ {:.2}%", cpu_utilisation);
  
     if !metrics.safety_alerts.is_empty()
     {
-        println!("║  SAFETY ALERTS:");
+        println!("|  SAFETY ALERTS:");
         for alert in &metrics.safety_alerts
         {
-            println!("║    {alert}"); // print each alert
+            println!("|    {alert}"); // print each alert
         }
     }
-    println!("╚══════════════════════════════════════════════════════════════════════╝\n");
+    println!("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n");
 }
 
 
@@ -1548,11 +1608,11 @@ fn print_final_report(metrics: &SystemMetrics, simulation_end_time: u64)
 // Sets up all shared state, spawns all OS threads, schedules RM background tasks via ScheduledThreadPool
 // In the end, shuts everything down gracefully and prints final report
 fn main()
-{
+{ 
     println!("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
     println!("|  SATELLITE ONBOARD CONTROL SYSTEM (OCS) - BY LUVEN MARK (TP071542) |");
     println!("|  TYPE: HARD RTS, demonstrating the learnt Hard RTS concepts.       |");
-    println!("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n");
+    println!("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
 
     // Initialization
     let simulation_start_time: Instant = Instant::now();
@@ -1563,7 +1623,7 @@ fn main()
     let shared_priority_buffer: Shared<PriorityBuffer> = Arc::new(Mutex::new(PriorityBuffer::new(PRIORITY_BUFFER)));
     let shared_system_metrics: Shared<SystemMetrics> = Arc::new(Mutex::new(SystemMetrics::new()));
     let shared_system_state: Shared<SystemState> = Arc::new(Mutex::new(SystemState::Normal));
-    let shared_downlink_queue: Shared<Vec<DataPacket>> = Arc::new(Mutex::new(Vec::<DataPacket>::with_capacity(50))); // XXX: need?
+    let shared_downlink_queue: Shared<Vec<DataPacket>> = Arc::new(Mutex::new(Vec::<DataPacket>::with_capacity(50))); // 50 = 10,000ms / 200ms  (Visibility Window / Packet Period) = 50 packets 
     let shared_emergency_flag: Shared<bool> = Arc::new(Mutex::new(false));
     let shared_running_flag: Shared<bool> = Arc::new(Mutex::new(true));
 
@@ -1597,9 +1657,10 @@ fn main()
     os_thread_handles.push(thread::spawn
     ({
         let running = Arc::clone(&shared_running_flag);  // need to clone as the Arc is shared
+        let emergency = Arc::clone(&shared_emergency_flag);
         let logger = Arc::clone(&log);
         let start = simulation_start_time;
-        move || command_receiver_thread(running, logger, start)
+        move || command_receiver_thread(running, emergency, logger, start)
     }));
 
     // SENSOR 1: Thermal thread
@@ -1622,11 +1683,10 @@ fn main()
         let buffer = Arc::clone(&shared_priority_buffer);
         let metrics = Arc::clone(&shared_system_metrics);
         let state = Arc::clone(&shared_system_state); 
-        let transmit = telemetry_sender.clone();
         let running = Arc::clone(&shared_running_flag);
         let logger = Arc::clone(&log);
         let start = simulation_start_time;
-        move || accelerometer_thread(buffer, metrics, state, transmit, running, logger, start)
+        move || accelerometer_thread(buffer, metrics, state, running, logger, start)
     }));
 
     // SENSOR 3: Gyroscope thread
@@ -1635,11 +1695,10 @@ fn main()
         let buffer = Arc::clone(&shared_priority_buffer);
         let metrics = Arc::clone(&shared_system_metrics);
         let state = Arc::clone(&shared_system_state);
-        let transmit = telemetry_sender.clone();
         let running = Arc::clone(&shared_running_flag);
         let logger = Arc::clone(&log);
         let start = simulation_start_time;
-        move || gyroscope_thread(buffer, metrics, state, transmit, running, logger, start)
+        move || gyroscope_thread(buffer, metrics, state, running, logger, start)
     }));
 
     // ScheduledThreadPool for 3 Rate Monotonic Tasks
@@ -1648,7 +1707,7 @@ fn main()
     rate_monotonic_thread_pool.execute_at_fixed_rate // fixed rate means that the task will be executed at fixed intervals
     (
         Duration::from_millis(10),                  // task will be executed every 10ms
-        Duration::from_millis(HEALTH_MONITOR_PERIOD),       // XXX: change duration
+        Duration::from_millis(HEALTH_MONITOR_PERIOD),
         health_monitor_task
         (
             Arc::clone(&shared_priority_buffer),
@@ -1696,12 +1755,11 @@ fn main()
     ({
         let downlink_queue = Arc::clone(&shared_downlink_queue);
         let metrics = Arc::clone(&shared_system_metrics);
-        let state = Arc::clone(&shared_system_state);
         let transmit = telemetry_sender.clone();
         let running = Arc::clone(&shared_running_flag);
         let logger = Arc::clone(&log);
         let start = simulation_start_time;
-        move || downlink_thread(downlink_queue, metrics, state, transmit, running, logger, start)
+        move || downlink_thread(downlink_queue, metrics, transmit, running, logger, start)
     }));
 
     // Fault injector thread
@@ -1709,11 +1767,12 @@ fn main()
     ({
         let metrics = Arc::clone(&shared_system_metrics);
         let state = Arc::clone(&shared_system_state);
+        let emergency = Arc::clone(&shared_emergency_flag);
         let transmit = telemetry_sender.clone();
         let running = Arc::clone(&shared_running_flag);
         let logger = Arc::clone(&log);
         let start = simulation_start_time;
-        move || fault_injector_thread(metrics, state, transmit, running, logger, start)
+        move || fault_injector_thread(metrics, state, emergency, transmit, running, logger, start)
     }));
 
     // Drop the final sender so udp_sender_thread can exit cleanly
