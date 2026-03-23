@@ -69,27 +69,6 @@ const LOG_FILE: &str = "gcs.log";
 #[derive(Serialize, Deserialize, Debug)]
 enum OCSMessage 
 {
-    // Thermal
-    // {
-    //     sequence: u64,
-    //     temperature: f64,
-    //     drift: i64,
-    // },
- 
-    // Accelerometer
-    // {
-    //     sequence: u64,
-    //     velocity: f64,
-    //     drift: i64,
-    // },
- 
-    // Gyroscope
-    // {
-    //     sequence: u64,
-    //     orientation: f64,
-    //     drift: i64,
-    // },
- 
     Status
     {
         iteration: u64,
@@ -141,18 +120,11 @@ fn encode_command(command: &GCSCommand) -> String
 
 
 // ==============
-// Typestate pattern (Lab 7) — GCS can be in Normal mode or FaultLocked mode.
-// The key safety property: dispatch_command() only accepts &GCSMode<Normal>.
-// Passing &GCSMode<FaultLocked> is a compile error — the compiler itself prevents
-// sending commands during a fault, not just a runtime check.
+// Typestate pattern 
+// ==============
 
 // The two possible GCS operating modes
 struct Normal;
-
-// CHANGED: added FaultLocked — required to complete the Lab 7 typestate pattern.
-// Without this, GCSMode<FaultLocked> cannot be expressed and the two-state
-// typestate demonstration is incomplete.
-struct FaultLocked;
 
 // Generic GCS mode struct — S carries the current mode as a type marker
 struct GCSMode<S>
@@ -167,26 +139,8 @@ impl GCSMode<Normal>
     {
         GCSMode { state: PhantomData }
     }
-
-    // CHANGED: added lock_for_fault — completes the Normal -> FaultLocked transition
-    fn lock_for_fault(self) -> GCSMode<FaultLocked>
-    {
-        GCSMode { state: PhantomData }
-    }
 }
 
-// CHANGED: added impl GCSMode<FaultLocked> — completes the FaultLocked -> Normal transition.
-// Note there is no dispatch_command here — commands are BLOCKED in FaultLocked mode.
-impl GCSMode<FaultLocked>
-{
-    fn clear_fault(self) -> GCSMode<Normal>
-    {
-        GCSMode { state: PhantomData }
-    }
-}
-
-// CHANGED: dispatch_command now takes &GCSMode<Normal> as the first parameter.
-// This is the Lab 7 compile-time safety guarantee — the caller must hold a
 // GCSMode<Normal> to call this function, which can only be constructed after
 // confirming fault_active is false at runtime.
 fn dispatch_command(normal_mode: &GCSMode<Normal>, command_sender: &mpsc::Sender<UplinkCommand>, payload: String)
@@ -244,7 +198,6 @@ enum OCSFaultKind
 {
     ThermalAlert,
     FaultInjected,
-    GyroRestart,  // CHANGED: added — OCS sends "gyro_restart" when the gyroscope restarts
     MissionAbort,
     Unknown,
 }
@@ -583,15 +536,16 @@ async fn telemetry_processor_task(mut receiver: mpsc::Receiver<IncomingPacket>, 
                 let inter_packet_gap: i64 = match last_received_at
                 {
                     Some(time) => time.elapsed().as_millis() as i64,
-                    None    => 0,
+                    None => 0,
                 };
                 last_received_at = Some(Instant::now());
  
                 // Route each message type to the right handler
+                // Route each message type to the right handler
                 match &message
                 {
                     // =============
-                    // OCS messages
+                    // Alert Message
                     // =============
                     OCSMessage::Alert {..} =>
                     {
@@ -601,15 +555,18 @@ async fn telemetry_processor_task(mut receiver: mpsc::Receiver<IncomingPacket>, 
 
                     // =============
                     // Status Message
+                    // Receiving Status means the satellite is alive —
+                    // reset the thermal watchdog so it doesn't false-fire.
                     // =============
                     OCSMessage::Status {iteration, fill, state: system_state, drift} =>
                     {
-                        write_log(&logger, &format!("[{}ms] [Telemetry Receiver] status  iteration={iteration}  fill={fill:.1}%  state={}  drift={}ms  decode={}µs", simulation_elapsed(&simulation_start), system_state, drift, decode_time));
+                        write_log(&logger, &format!(
+                            "[{}ms] [Telemetry Receiver] status  iteration={iteration}  fill={fill:.1}%  state={}  drift={}ms  decode={}µs",
+                            simulation_elapsed(&simulation_start), system_state, drift, decode_time
+                        ));
 
                         let mut gcs_state = state.lock().unwrap();
 
-                        // CHANGED: added thermal miss reset — Status is a liveness signal, so
-                        // receiving it means the satellite is alive and the thermal watchdog should not fire
                         gcs_state.thermal_misses = 0;
                         gcs_state.last_thermal = simulation_elapsed(&simulation_start);
 
@@ -618,185 +575,75 @@ async fn telemetry_processor_task(mut receiver: mpsc::Receiver<IncomingPacket>, 
                             gcs_state.loss_of_contact = false;
                         }
                     }
- 
-                    // // =============
-                    // // Thermal Message
-                    // // =============
-                    // OCSMessage::Thermal {sequence, temperature, drift} =>
-                    // {
-                    //     write_log(&logger, &format!("[{}ms] [Telemetry Receiver] thermal sequence={sequence}  temperature={temperature:.2}°C  drift={:+}ms  decode={}µs", simulation_elapsed(&simulation_start), drift, decode_time));
 
-                    //     let mut gcs_state = state.lock().unwrap();
-
-                    //     gcs_state.thermal_misses = 0;  // reset miss counter — we got data
-                    //     gcs_state.last_thermal = simulation_elapsed(&simulation_start);
-
-                    //     if gcs_state.loss_of_contact
-                    //     {
-                    //         gcs_state.loss_of_contact = false;
-
-                    //         print_and_log(&logger, &format!("[{}ms] [Telemetry Receiver] Thermal contact restored.", simulation_elapsed(&simulation_start)));
-                    //     }
-                    // }
- 
-
- 
-                    // // =============
-                    // // Accelerometer Message
-                    // // =============
-                    // OCSMessage::Accelerometer {sequence, velocity, drift} =>
-                    // {
-                    //     write_log(&logger, &format!("[{}ms] [Telemetry Receiver] accelerometer   sequence={sequence}  velocity={velocity:.4}  drift={}ms  decode={}µs", simulation_elapsed(&simulation_start), drift, decode_time));
-
-                    //     let mut gcs_state = state.lock().unwrap();
-
-                    //     gcs_state.accelerometer_misses = 0;
-                    //     gcs_state.last_accelerometer = simulation_elapsed(&simulation_start);
-
-                    //     if gcs_state.loss_of_contact
-                    //     {
-                    //         gcs_state.loss_of_contact = false;
-                    //     }
-                    // }
- 
-                    // // =============
-                    // // Gyroscope Message
-                    // // =============
-                    // OCSMessage::Gyroscope {sequence, orientation, drift} =>
-                    // {
-                    //     write_log(&logger, &format!("[{}ms] [Telemetry Receiver] gyroscope    sequence={sequence}  orientation={orientation:.4}  drift={}  decode={}µs", simulation_elapsed(&simulation_start), drift,decode_time));
-
-                    //     let mut gcs_state = state.lock().unwrap();
-
-                    //     gcs_state.gyroscope_misses = 0;
-                    //     gcs_state.last_gyroscope   = simulation_elapsed(&simulation_start);
-
-                    //     if gcs_state.loss_of_contact
-                    //     {
-                    //         gcs_state.loss_of_contact = false;
-                    //     }
-                    // }
- 
                     // =============
                     // Downlink Message
+                    // The OCS bundles all sensor readings into one compressed packet.
+                    // We unpack each reading here and update state just like the old
+                    // individual Thermal/Accelerometer/Gyroscope messages used to.
                     // =============
-                    OCSMessage::Downlink {    packet_id,
-    reading_count,
-    bytes,
-    queue_latency,
-    payload,} =>
+                    OCSMessage::Downlink { packet_id, reading_count, bytes, queue_latency, payload } =>
                     {
-                        write_log(&logger, &format!("[{}ms] [Telemetry Receiver] downlink packet={}  {} bytes  queue_latency={}ms  decode={}µs",          simulation_elapsed(&simulation_start),
-            packet_id,
-            reading_count,
-            bytes,
-            queue_latency,
-            decode_time);
+                        // Log the outer packet summary — 6 placeholders, 6 args after timestamp
+                        write_log(&logger, &format!("[{}ms] [Telemetry Receiver] downlink packet_id={}  reading_count={}  {}bytes  queue_latency={}ms  decode={}µs", simulation_elapsed(&simulation_start), packet_id, reading_count, bytes, queue_latency, decode_time));
 
-                    let compressed_payload = match serde_json::from_str::<CompressedPayload>(payload)
-                    {
-                        Ok(parsed_payload) => parsed_payload,
-                        Err(error) =>
+                        let compressed_payload = match serde_json::from_str::<CompressedPayload>(payload)
                         {
-                            write_log
-                            (
-                                &logger,
-                                &format!
-                                (
-                                    "[{}ms] [Telemetry Receiver] downlink payload parse fail: {}",
-                                    simulation_elapsed(&simulation_start),
-                                    error
-                                )
-                            );
-                            continue;
+                            Ok(parsed_payload) => parsed_payload,
+                            Err(error) =>
+                            {
+                                write_log(&logger, &format!("[{}ms] [Telemetry Receiver] downlink inner payload parse fail: {}", simulation_elapsed(&simulation_start), error));
+                                continue;
+                            }
+                        };
+
+                        let mut gcs_state = state.lock().unwrap();
+
+                        // Walk every reading in the bundle and route it to the right state update.
+                        for reading in &compressed_payload.readings
+                        {
+                            match reading.sensor_type.as_str()
+                            {
+                                "Thermal" =>
+                                {
+                                    write_log(&logger, &format!("[{}ms] [Telemetry Receiver] thermal  seq={}  temp={:.2}C  drift={:+}ms", simulation_elapsed(&simulation_start), reading.sequence, reading.value, reading.drift));
+                               
+                                    gcs_state.thermal_misses = 0;
+                                    gcs_state.last_thermal = simulation_elapsed(&simulation_start);
+                                }
+
+                                "Accelerometer" =>
+                                {
+                                    write_log(&logger, &format!("[{}ms] [Telemetry Receiver] accelerometer  seq={}  velocity={:.4}  drift={:+}ms", simulation_elapsed(&simulation_start), reading.sequence, reading.value, reading.drift));
+                                
+                                    gcs_state.accelerometer_misses = 0;
+                                    gcs_state.last_accelerometer = simulation_elapsed(&simulation_start);
+                                }
+
+                                "Gyroscope" =>
+                                {
+                                    write_log(&logger, &format!("[{}ms] [Telemetry Receiver] gyroscope  seq={}  orientation={:.4}  drift={:+}ms", simulation_elapsed(&simulation_start), reading.sequence, reading.value, reading.drift));
+                           
+                                    gcs_state.gyroscope_misses = 0;
+                                    gcs_state.last_gyroscope = simulation_elapsed(&simulation_start);
+                                }
+
+                                other =>
+                                {
+                                    write_log(&logger, &format!("[{}ms] [Telemetry Receiver] unknown sensor_type in downlink: {}", simulation_elapsed(&simulation_start), other));
+                                }
+                            }
                         }
-                    };
 
-                    let mut gcs_state = state.lock().unwrap();
-
-                    for reading in &compressed_payload.readings
-                    {
-                        match reading.sensor_type.as_str()
+                        // Any downlink packet proves the satellite is alive
+                        if gcs_state.loss_of_contact
                         {
-                            "Thermal" =>
-                            {
-                                write_log
-                                (
-                                    &logger,
-                                    &format!
-                                    (
-                                        "[{}ms] [Telemetry Receiver] thermal sequence={}  temperature={:.2}C  drift={:+}ms",
-                                        simulation_elapsed(&simulation_start),
-                                        reading.sequence,
-                                        reading.value,
-                                        reading.drift
-                                    )
-                                );
-
-                                gcs_state.thermal_misses = 0;
-                                gcs_state.last_thermal = simulation_elapsed(&simulation_start);
-                            }
-
-                            "Accelerometer" =>
-                            {
-                                write_log
-                                (
-                                    &logger,
-                                    &format!
-                                    (
-                                        "[{}ms] [Telemetry Receiver] accelerometer sequence={}  velocity={:.4}  drift={:+}ms",
-                                        simulation_elapsed(&simulation_start),
-                                        reading.sequence,
-                                        reading.value,
-                                        reading.drift
-                                    )
-                                );
-
-                                gcs_state.accelerometer_misses = 0;
-                                gcs_state.last_accelerometer = simulation_elapsed(&simulation_start);
-                            }
-
-                            "Gyroscope" =>
-                            {
-                                write_log
-                                (
-                                    &logger,
-                                    &format!
-                                    (
-                                        "[{}ms] [Telemetry Receiver] gyroscope sequence={}  orientation={:.4}  drift={:+}ms",
-                                        simulation_elapsed(&simulation_start),
-                                        reading.sequence,
-                                        reading.value,
-                                        reading.drift
-                                    )
-                                );
-
-                                gcs_state.gyroscope_misses = 0;
-                                gcs_state.last_gyroscope = simulation_elapsed(&simulation_start);
-                            }
-
-                            other =>
-                            {
-                                write_log
-                                (
-                                    &logger,
-                                    &format!
-                                    (
-                                        "[{}ms] [Telemetry Receiver] unknown sensor type in downlink: {}",
-                                        simulation_elapsed(&simulation_start),
-                                        other
-                                    )
-                                );
-                            }
+                            gcs_state.loss_of_contact = false;
                         }
                     }
 
-                    if gcs_state.loss_of_contact
-                    {
-                        gcs_state.loss_of_contact = false;
-                    }
-                }
- 
+                } 
+
                 // Update metrics for every successfully decoded packet
                 let mut metric = metrics.lock().unwrap();
                 metric.telemetry_received += 1;
@@ -806,6 +653,7 @@ async fn telemetry_processor_task(mut receiver: mpsc::Receiver<IncomingPacket>, 
         }
     }
 }
+
 
 // Handles an incoming OCS Alert message.
 // Checks the alert type and decides whether to engage the safety interlock.
@@ -823,9 +671,8 @@ fn handle_ocs_alert(message: &OCSMessage, state: &Shared<GCSState>, metrics: &Sh
     {
         "mission_abort" => OCSFaultKind::MissionAbort,
         "thermal_alert" => OCSFaultKind::ThermalAlert,
-        "fault"         => OCSFaultKind::FaultInjected,
-        "gyro_restart"  => OCSFaultKind::GyroRestart,  // CHANGED: added — OCS sends this when the gyroscope restarts
-        _               => OCSFaultKind::Unknown,
+        "fault" => OCSFaultKind::FaultInjected,
+        _ => OCSFaultKind::Unknown,
     };
 
     let fault_message = format!("[{}ms] [OCS-ALERT] {fault_kind:?}  event=\"{event}\"", simulation_elapsed(simulation_start));
@@ -867,7 +714,7 @@ fn handle_ocs_alert(message: &OCSMessage, state: &Shared<GCSState>, metrics: &Sh
             });
         }
 
-        OCSFaultKind::ThermalAlert | OCSFaultKind::FaultInjected | OCSFaultKind::GyroRestart => // CHANGED: added GyroRestart — a gyroscope restart should also engage the safety interlock
+        OCSFaultKind::ThermalAlert | OCSFaultKind::FaultInjected  => 
         {
             // Engage the safety interlock — block all commands until the fault clears
             let mut state = state.lock().unwrap();
@@ -1060,7 +907,10 @@ async fn fault_manager_task(state: Shared<GCSState>, metrics: Shared<GCSMetrics>
 
 // ===============
 // Part 2 — Command Uplink Tasks
-// Three Rate Monotonic tasks that periodically send check commands to the OCS
+// Three Rate Monotonic tasks that periodically send check commands to the OCS.
+// RM scheduling: shortest period = highest priority.
+// The GCS command periods are 2x the OCS sensor periods —
+// fast enough to monitor health without flooding the uplink.
 // ===============
 
 // Thermal Check — RM Priority 1 (fastest period = highest priority)
@@ -1070,7 +920,7 @@ async fn thermal_command_task(command_sender: mpsc::Sender<UplinkCommand>, state
 
     let mut iteration: u64 = 0;
     let task_start: Instant = Instant::now();    // reference point for drift calculation
-    let mut last_tick: Instant = Instant::now();    // reference point for jitter calculation
+    let mut last_tick: Instant = Instant::now(); // reference point for jitter calculation
 
     loop
     {
@@ -1086,21 +936,20 @@ async fn thermal_command_task(command_sender: mpsc::Sender<UplinkCommand>, state
             _ = sleep(Duration::from_millis(THERMAL_COMMAND_PERIOD)) => {}
         }
 
-        // Drift: how far off are we from the expected schedule?
+        // Drift: actual elapsed vs expected elapsed — positive means running late
         let expected_time = iteration * THERMAL_COMMAND_PERIOD;
-        let actual_time = task_start.elapsed().as_millis() as u64;
-        let drift = actual_time as i64 - expected_time as i64;
+        let actual_time   = task_start.elapsed().as_millis() as u64;
+        let drift         = actual_time as i64 - expected_time as i64;
 
-        // Jitter: variation between actual tick intervals
+        // Jitter: deviation of this interval from the ideal period (in microseconds)
         let this_interval = last_tick.elapsed().as_micros() as i64;
         let jitter_timing = (this_interval - (THERMAL_COMMAND_PERIOD as i64 * 1000)).unsigned_abs() as i64;
         last_tick = Instant::now();
 
-        // Block this command if the GCS is in fault mode
+        // Safety interlock — block all commands while a fault is active
         if state.lock().unwrap().fault_active
         {
             let rejection_message = format!("[{}ms] [REJECT] ThermalCheck iteration={iteration} — FaultLocked", simulation_elapsed(&simulation_start));
-            
             write_log(&logger, &rejection_message);
             let mut metric = metrics.lock().unwrap();
             metric.commands_rejected += 1;
@@ -1109,22 +958,21 @@ async fn thermal_command_task(command_sender: mpsc::Sender<UplinkCommand>, state
             continue;
         }
 
-        // CHANGED: bind GCSMode<Normal> to a named variable instead of let _ = ...
-        // 'let _ =' discards the value immediately, so &mode would not exist.
-        // Binding it to 'normal_mode' is what makes the typestate check real —
-        // dispatch_command requires &GCSMode<Normal>, proving we checked fault_active first.
-        let normal_mode = GCSMode::<Normal>::new(); // CHANGED: was 'let _ = GCSMode::<Normal>::new()'
+        // Typestate guard — can only construct GCSMode<Normal> when fault_active is false.
+        // dispatch_command requires &GCSMode<Normal>, so this is compile-time proof
+        // that the interlock was checked before dispatching.
+        let normal_mode = GCSMode::<Normal>::new();
 
         let payload = encode_command(&GCSCommand
         {
-            tag: "command".into(),
-            command: "ThermalCheck".into(),
+            tag:       "command".into(),
+            command:   "ThermalCheck".into(),
             timestamp: simulation_elapsed(&simulation_start),
         });
 
-        dispatch_command(&normal_mode, &command_sender, payload); // CHANGED: was dispatch_command(&command_sender, payload) — now passes &normal_mode as required by Lab 7
+        dispatch_command(&normal_mode, &command_sender, payload); // RM-P1
 
-        // Log a warning if jitter exceeded our threshold
+        // Jitter warning — log as deadline violation if over the 2ms uplink limit
         if jitter_timing > UPLINK_JITTER_LIMIT
         {
             let warning = format!("[{}ms] [WARN] Thermal Command jitter {}µs iteration={iteration}", simulation_elapsed(&simulation_start), jitter_timing);
@@ -1137,13 +985,13 @@ async fn thermal_command_task(command_sender: mpsc::Sender<UplinkCommand>, state
             metric.thermal_jitter.push(jitter_timing);
             metric.drift.push(drift);
             metric.active_time  += loop_start.elapsed().as_millis() as u64;
-            metric.elapsed_time  = task_start.elapsed().as_millis() as u64;
+            metric.elapsed_time  = task_start.elapsed().as_millis() as u64; // kept here — Thermal runs most often so it tracks sim time accurately
         }
 
-        // Print a status line every 20 iterations so the log doesn't get spammy
+        // Log every 20 iterations — 50ms period means every ~1 second
         if iteration % 20 == 0
         {
-            write_log(&logger, &format!( "[{}ms] [Thermal Command] iteration={iteration:>4}  drift={drift:+}ms  jitter={jitter_timing}µs", simulation_elapsed(&simulation_start)));
+            write_log(&logger, &format!("[{}ms] [Thermal Command] iteration={iteration:>4}  drift={drift:+}ms  jitter={jitter_timing}µs", simulation_elapsed(&simulation_start)));
         }
         iteration += 1;
     }
@@ -1152,7 +1000,7 @@ async fn thermal_command_task(command_sender: mpsc::Sender<UplinkCommand>, state
 // Accelerometer Check — RM Priority 2
 async fn accelerometer_command_task(command_sender: mpsc::Sender<UplinkCommand>, state: Shared<GCSState>, metrics: Shared<GCSMetrics>, logger: Shared<File>, simulation_start: Instant, shutdown: CancellationToken)
 {
-    write_log(&logger, &format!( "[{}ms] [Accelerometer Command] Started.  period={}ms  RM-P2", simulation_elapsed(&simulation_start), ACCELEROMETER_COMMAND_PERIOD));
+    write_log(&logger, &format!("[{}ms] [Accelerometer Command] Started.  period={}ms  RM-P2", simulation_elapsed(&simulation_start), ACCELEROMETER_COMMAND_PERIOD));
 
     let mut iteration: u64 = 0;
     let task_start: Instant = Instant::now();
@@ -1172,20 +1020,20 @@ async fn accelerometer_command_task(command_sender: mpsc::Sender<UplinkCommand>,
             _ = sleep(Duration::from_millis(ACCELEROMETER_COMMAND_PERIOD)) => {}
         }
 
+        // Drift: actual elapsed vs expected elapsed
         let expected_time = iteration * ACCELEROMETER_COMMAND_PERIOD;
-        let actual_time = task_start.elapsed().as_millis() as u64;
-        let drift = actual_time as i64 - expected_time as i64;
+        let actual_time   = task_start.elapsed().as_millis() as u64;
+        let drift         = actual_time as i64 - expected_time as i64;
 
-        // Use microseconds for jitter — milliseconds would lose too much precision here
+        // Jitter: microseconds precision — 120ms period makes ms too coarse
         let this_interval = last_tick.elapsed().as_micros() as i64;
         let jitter_timing = (this_interval - (ACCELEROMETER_COMMAND_PERIOD as i64 * 1000)).unsigned_abs() as i64;
         last_tick = Instant::now();
 
-        // Block if faulted
+        // Safety interlock — block all commands while a fault is active
         if state.lock().unwrap().fault_active
         {
             let rejection_message = format!("[{}ms] [REJECT] AccelerometerCheck iteration={iteration} — FaultLocked", simulation_elapsed(&simulation_start));
-            
             write_log(&logger, &rejection_message);
             let mut metric = metrics.lock().unwrap();
             metric.commands_rejected += 1;
@@ -1194,16 +1042,25 @@ async fn accelerometer_command_task(command_sender: mpsc::Sender<UplinkCommand>,
             continue;
         }
 
-        // CHANGED: bind to 'normal_mode' — same reason as thermal task
-        let normal_mode = GCSMode::<Normal>::new(); // CHANGED: was 'let _ = GCSMode::<Normal>::new()'
+        let normal_mode = GCSMode::<Normal>::new();
+
         let payload = encode_command(&GCSCommand
         {
-            tag: "command".into(),
-            command: "AccelerometerCheck".into(),
+            tag:       "command".into(),
+            command:   "AccelerometerCheck".into(),
             timestamp: simulation_elapsed(&simulation_start),
         });
 
-        dispatch_command(&normal_mode, &command_sender, payload); // CHANGED: now passes &normal_mode
+        dispatch_command(&normal_mode, &command_sender, payload); // RM-P2
+
+        // FIX: jitter warning was missing from Accelerometer — added to match Thermal and Gyroscope.
+        // Without this, any jitter spike here is silently dropped and never reaches the final report.
+        if jitter_timing > UPLINK_JITTER_LIMIT
+        {
+            let warning = format!("[{}ms] [WARN] Accelerometer Command jitter {}µs iteration={iteration}", simulation_elapsed(&simulation_start), jitter_timing);
+            write_log(&logger, &warning);
+            metrics.lock().unwrap().deadline_violations.push(warning);
+        }
 
         {
             let mut metric = metrics.lock().unwrap();
@@ -1212,9 +1069,10 @@ async fn accelerometer_command_task(command_sender: mpsc::Sender<UplinkCommand>,
             metric.active_time += loop_start.elapsed().as_millis() as u64;
         }
 
+        // Log every 8 iterations — 120ms period means every ~1 second
         if iteration % 8 == 0
         {
-            write_log(&logger, &format!("[{}ms] [Accelerometer Command] iteration={iteration:>4}  drift={drift:+}ms  jitter={jitter_timing}µs", simulation_elapsed(&simulation_start)),);
+            write_log(&logger, &format!("[{}ms] [Accelerometer Command] iteration={iteration:>4}  drift={drift:+}ms  jitter={jitter_timing}µs", simulation_elapsed(&simulation_start)));
         }
 
         iteration += 1;
@@ -1244,20 +1102,19 @@ async fn gyroscope_command_task(command_sender: mpsc::Sender<UplinkCommand>, sta
             _ = sleep(Duration::from_millis(GYROSCOPE_COMMAND_PERIOD)) => {}
         }
 
-        // Calculate drift and jitter same way as the other RM tasks
+        // Drift and jitter — same pattern as the other two RM tasks
         let expected_time = iteration * GYROSCOPE_COMMAND_PERIOD;
-        let actual_time = task_start.elapsed().as_millis() as u64;
-        let drift = actual_time as i64 - expected_time as i64;
+        let actual_time   = task_start.elapsed().as_millis() as u64;
+        let drift         = actual_time as i64 - expected_time as i64;
 
         let this_interval = last_tick.elapsed().as_micros() as i64;
         let jitter_timing = (this_interval - (GYROSCOPE_COMMAND_PERIOD as i64 * 1000)).unsigned_abs() as i64;
         last_tick = Instant::now();
 
-        // Block if faulted
+        // Safety interlock — block all commands while a fault is active
         if state.lock().unwrap().fault_active
         {
             let rejection_message = format!("[{}ms] [REJECT] GyroscopeCheck iteration={iteration} — FaultLocked", simulation_elapsed(&simulation_start));
-           
             write_log(&logger, &rejection_message);
             let mut metric = metrics.lock().unwrap();
             metric.commands_rejected += 1;
@@ -1266,23 +1123,21 @@ async fn gyroscope_command_task(command_sender: mpsc::Sender<UplinkCommand>, sta
             continue;
         }
 
-        // CHANGED: bind to 'normal_mode' — same reason as thermal and accelerometer tasks
-        let normal_mode = GCSMode::<Normal>::new(); // CHANGED: was 'let _ = GCSMode::<Normal>::new()'
+        let normal_mode = GCSMode::<Normal>::new();
 
         let payload = encode_command(&GCSCommand
         {
-            tag: "command".into(),
-            command: "GyroscopeCheck".into(),
+            tag:       "command".into(),
+            command:   "GyroscopeCheck".into(),
             timestamp: simulation_elapsed(&simulation_start),
         });
 
-        // dispatch_command only accepts &GCSMode<Normal> — compile-time safety check
-        dispatch_command(&normal_mode, &command_sender, payload); // CHANGED: now passes &normal_mode
+        dispatch_command(&normal_mode, &command_sender, payload); // RM-P3
 
+        // Jitter warning — same threshold as Thermal and Accelerometer
         if jitter_timing > UPLINK_JITTER_LIMIT
         {
             let warning = format!("[{}ms] [WARN] Gyroscope Command jitter {}µs iteration={iteration}", simulation_elapsed(&simulation_start), jitter_timing);
-            
             write_log(&logger, &warning);
             metrics.lock().unwrap().deadline_violations.push(warning);
         }
@@ -1294,6 +1149,7 @@ async fn gyroscope_command_task(command_sender: mpsc::Sender<UplinkCommand>, sta
             metric.active_time += loop_start.elapsed().as_millis() as u64;
         }
 
+        // Log every 5 iterations — 333ms period means every ~1.6 seconds
         if iteration % 5 == 0
         {
             write_log(&logger, &format!("[{}ms] [Gyroscope Command] iteration={iteration:>4}  drift={drift:+}ms  jitter={jitter_timing}µs", simulation_elapsed(&simulation_start)));
@@ -1435,10 +1291,10 @@ fn print_report(metric: &GCSMetrics, state: &GCSState, simulation_start: &Instan
 #[tokio::main]
 async fn main()
 {
-    println!("╔═══════════════════════════════════════════════════════╗");
-    println!("║  GCS — Ground Control Station                         ║");
-    println!("║  CT087-3-3  |  Student B  |  Soft RTS / Tokio         ║");
-    println!("╚═══════════════════════════════════════════════════════╝\n");
+    println!("╔════════════════════════════════════════════════════════════════╗");
+    println!("║  GROUND CONTROL STATION (GCS) — BY CHONG CHUN KIT (TP077436)   ║");
+    println!("║  TYPE: SOFT RTS, demonstrating the learnt Soft RTS concepts.   ║");
+    println!("╚════════════════════════════════════════════════════════════════╝\n");
 
     // Record when the simulation started so we can measure elapsed time throughout
     let simulation_start = Instant::now();
