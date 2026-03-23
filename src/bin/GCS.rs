@@ -1185,7 +1185,7 @@ async fn metrics_reporter_task(metrics: Shared<GCSMetrics>, _: Shared<GCSState>,
 // ===============
 // Final Report — printed at the end of the simulation
 // ===============
-fn print_report(metric: &GCSMetrics, state: &GCSState, simulation_start: &Instant)
+fn print_report(metric: &GCSMetrics, state: &GCSState)
 {
     // Calculate command rejection percentage
     let reject_percentage = if metric.commands_sent + metric.commands_rejected > 0
@@ -1201,28 +1201,17 @@ fn print_report(metric: &GCSMetrics, state: &GCSState, simulation_start: &Instan
     }
     else {0.0};
 
-    // Average backlog depth across all 10-second snapshots
-    let avg_backlog_depth = if metric.backlog_depth_samples.is_empty() {0.0}
-    else
-    {
-        metric.backlog_depth_samples.iter().sum::<usize>() as f64 / metric.backlog_depth_samples.len() as f64
-    };
 
     println!("\n|==============================================================================================|");
     println!( "|                            GCS FINAL REPORT - BY CHONG CHUN KIT (TP077436)                   |");
     println!( "|==============================================================================================|");
     println!(
-        "|  Mode: {}  Loss of Contact: {}",
-        if state.fault_active {"FaultLocked"} else {"Normal"},
-        state.loss_of_contact,
+        "|  Mode: {} ",
+        if state.fault_active {"FaultLocked"} else {"Normal"}
     );
     println!(
         "|  Telemetry: receiver={}  missed={}",
         metric.telemetry_received, metric.missed_packets
-    );
-    println!(
-        "|  Backlog depth  avg={:.1}  peak={}  channel_cap=100",
-        avg_backlog_depth, metric.backlog_peak
     );
     println!(
         "|  Decode latency (µs)  deadline={}ms  (spawn_blocking)",
@@ -1375,6 +1364,6 @@ async fn main()
 
     // Print the final summary
     println!("\n[GCS] FINAL REPORT:");
-    print_report(&metrics.lock().unwrap(), &state.lock().unwrap(), &simulation_start);
+    print_report(&metrics.lock().unwrap(), &state.lock().unwrap());
     println!("[GCS] Done.  Full event log -> {LOG_FILE}");
 }
