@@ -69,27 +69,6 @@ const LOG_FILE: &str = "ocs.log";
 #[derive(Serialize, Deserialize, Debug)]
 enum OCSMessage
 {
-    Thermal
-    {
-        sequence: u64,
-        temperature: f64,
-        drift: i64,
-    },
- 
-    Accelerometer
-    {
-        sequence: u64,
-        velocity: f64,
-        drift: i64,
-    },
- 
-    Gyroscope
-    {
-        sequence: u64,
-        orientation: f64,
-        drift: i64,
-    },
- 
     Status
     {
         iteration: u64,
@@ -100,9 +79,11 @@ enum OCSMessage
  
     Downlink
     {
-        packet: u64,
+        packet_id: u64,
+        reading_count: usize,
         bytes: usize,
         queue_latency: u64,
+        payload: String,
     },
  
     Alert
@@ -137,7 +118,9 @@ enum SensorType
 struct SensorReading
 {
     sensor_type: SensorType,
-    value: f64,
+    sequence: u64,
+    value: f64,          // Thermal: temperature, Accelerometer: velocity, Gyroscope: orientation
+    drift: i64,
     timestamp: u64,      // (ms) simulation time
     priority: u8,        // lower number = higher priority (1 is most critical)
 }
@@ -171,13 +154,30 @@ impl Eq for SensorReading {}
  
 // Compressed packet ready for downlink transmission
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct DataPacket
+struct DataPacket   
 {
     packet_id: u64,
     payload: String,     // serde_json of sensor readings
     created_at: u64,     // (ms) simulation time when packet was queued
     size_bytes: usize,
-} // XXX: remove?
+} 
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct CompressedReading
+{
+    sensor_type: String,
+    value: f64,
+    timestamp: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct CompressedPayload
+{
+    packet_id: u64,
+    reading_count: usize,
+    created_at: u64,
+    readings: Vec<CompressedReading>,
+}
  
 // System health state
 #[derive(Debug, Clone, PartialEq)]
@@ -290,9 +290,10 @@ impl Radio<Transmitting>
  
             let log_line = format!
             (
-                "[{}ms] [DOWNLINK] Transmit packet={}  {}bytes queue_latency={}ms",
+                "[{}ms] [DOWNLINK] packet={}  readings={}  {}bytes  queue_latency={}ms",
                 simulation_elapsed(simulation_start_time),
                 packet.packet_id,
+                packet.reading_count,
                 packet.size_bytes,
                 queue_latency
             );
@@ -305,8 +306,10 @@ impl Radio<Transmitting>
                 OCSMessage::Downlink
                 {
                     packet: packet.packet_id,
+                    reading_count: packet.reading_count,
                     bytes: packet.size_bytes,
                     queue_latency: queue_latency,
+                    payload: packet.payload.clone(),
                 }
             );
         }
@@ -667,7 +670,7 @@ fn command_receiver_thread(running: Shared<bool>, log: Shared<File>, simulation_
  
 // ~~~~ SECTION 1: Sensor Data Acquisition & Prioritization ~~~~~
 // 10. ---- THERMAL THREAD (CRITICAL SENSOR) ----
-fn thermal_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<SystemMetrics>, state: Shared<SystemState>, emergency: Shared<bool>, udp_sender: mpsc::Sender<String>, running: Shared<bool>, log: Shared<File>, simulation_start_time: Instant)
+fn thermal_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<SystemMetrics>, state: Shared<SystemState>, emergency: Shared<bool>, running: Shared<bool>, log: Shared<File>, simulation_start_time: Instant)
 {
     let log_line = format!
     (
@@ -703,7 +706,9 @@ fn thermal_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<Syste
         let sensor_reading = SensorReading
         {
             sensor_type: SensorType::Thermal,
+            sequence_number: sequence_number,
             value: temperature,
+            drift,
             timestamp: simulation_elapsed(&simulation_start_time),
             priority: 1,
         };
@@ -783,22 +788,7 @@ fn thermal_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<Syste
                 }
             }
         }
-
         //XXX: purpose of command from gcs? change value
-        // Send telemetry to GCS every 5 readings as downlink is expensive
-        if sequence_number % 5 == 0
-        {
-            send_ocs_message
-            (
-                &udp_sender,
-                OCSMessage::Thermal
-                {
-                    sequence: sequence_number,
-                    temperature: temperature,
-                    drift: drift,
-                }
-            );
-        }
         sequence_number += 1;
     }
  
@@ -812,7 +802,7 @@ fn thermal_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<Syste
  
  
 // 11. ---- ACCELEROMETER THREAD ----
-fn accelerometer_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<SystemMetrics>, state: Shared<SystemState>, udp_sender: mpsc::Sender<String>, running: Shared<bool>, log: Shared<File>, simulation_start_time: Instant)
+fn accelerometer_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<SystemMetrics>, state: Shared<SystemState>, running: Shared<bool>, log: Shared<File>, simulation_start_time: Instant)
 {
     let log_line = format!
     (
@@ -850,7 +840,9 @@ fn accelerometer_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared
         let sensor_reading = SensorReading
         {
             sensor_type: SensorType::Accelerometer,
+            sequence_number: sequence_number,
             value: magnitude,
+            drift,   
             timestamp: simulation_elapsed(&simulation_start_time),
             priority: 2,
         };
@@ -880,22 +872,6 @@ fn accelerometer_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared
                 metrics_lock.dropped_log.push(line);
             }
         }   
-
-        // Send telemetry to GCS every 10 readings
-        if sequence_number % 10 == 0
-        {
-            send_ocs_message
-            (
-                &udp_sender,
-                OCSMessage::Accelerometer
-                {
-                    sequence: sequence_number,
-                    velocity: magnitude,
-                    drift: drift,
-                }
-            );
-        }
-
         sequence_number += 1;
     }
 
@@ -909,7 +885,7 @@ fn accelerometer_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared
 
  
 // 12. ---- GYROSCOPE THREAD ----
-fn gyroscope_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<SystemMetrics>, state: Shared<SystemState>, udp_sender: mpsc::Sender<String>, running: Shared<bool>, log: Shared<File>, simulation_start_time: Instant)
+fn gyroscope_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<SystemMetrics>, state: Shared<SystemState>, running: Shared<bool>, log: Shared<File>, simulation_start_time: Instant)
 {
     let log_line = format!
     (
@@ -943,7 +919,9 @@ fn gyroscope_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<Sys
         let sensor_reading = SensorReading
         {
             sensor_type: SensorType::Gyroscope,
+            sequence_number: sequence_number,
             value: orientation,
+            drift,
             timestamp: simulation_elapsed(&simulation_start_time),
             priority: 3,
         };
@@ -973,22 +951,6 @@ fn gyroscope_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<Sys
                 metrics_lock.dropped_log.push(line);
             }
         }
-
-        // Send telemetry to GCS every 10 readings
-        if sequence_number % 25 == 0
-        {
-            send_ocs_message
-            (
-                &udp_sender,
-                OCSMessage::Gyroscope
-                {
-                    sequence: sequence_number,
-                    orientation: orientation,
-                    drift: drift,
-                }
-            );
-        }
-
         sequence_number += 1;
     }
 
@@ -1027,6 +989,43 @@ fn health_monitor_task(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<
             let buffer_lock = priority_buffer.lock().unwrap();
             (buffer_lock.fill_ratio(), buffer_lock.heap.len())
         };
+
+        // degraded-mode transition based on priority buffer fill
+        {
+            let mut system_state_lock = state.lock().unwrap();
+
+            if *system_state_lock != SystemState::MissionAbort
+            {
+                if fill_ratio >= DEGRADED_MODE
+                {
+                    if *system_state_lock == SystemState::Normal
+                    {
+                        *system_state_lock = SystemState::Degraded;
+
+                        let line = format!
+                        (
+                            "[{}ms] [Health] Buffer >= 80% -> DEGRADED",
+                            simulation_elapsed(&simulation_start_time)
+                        );
+                        append_console_log(&log, &line);
+                    }
+                }
+                else
+                {
+                    if *system_state_lock == SystemState::Degraded
+                    {
+                        *system_state_lock = SystemState::Normal;
+
+                        let line = format!
+                        (
+                            "[{}ms] [Health] Buffer recovered -> NORMAL",
+                            simulation_elapsed(&simulation_start_time)
+                        );
+                        append_console_log(&log, &line);
+                    }
+                }
+            }
+        }
         // Get system state
         let system_state = state.lock().unwrap().clone();
  
@@ -1121,23 +1120,29 @@ fn data_compression_task(priority_buffer: Shared<PriorityBuffer>, downlink_queue
  
         if !sensor_batch.is_empty()
         {
-            // Build batch payload with serde_json
-            let data_array: Vec<serde_json::Value> = sensor_batch.iter()
-                .map(|sensor_reading| serde_json::json!     // maps sensor_reading to json
-                ({
-                    "sensor": format!("{:?}", sensor_reading.sensor_type), // ? = enum to string
-                    "value": sensor_reading.value,
-                    "timestamp": sensor_reading.timestamp,
-                }))
-                .collect();  // collect into array
- 
-            let payload = serde_json::json! // previous maps array to json
-            ({
-                "packet_id": packet_id,
-                "reading_count": sensor_batch.len(),
-                "created_at": simulation_elapsed(&simulation_start_time),
-                "data": data_array,
-            }).to_string();
+            // Build a typed compressed payload
+            let compressed_readings: Vec<CompressedReading> = sensor_batch
+                .iter()
+                .map(|sensor_reading| CompressedReading     // maps sensor_reading to CompressedReading
+                {
+                    sensor_type: format!("{:?}", sensor_reading.sensor_type),  // ? = enum to string
+                    sequence: sensor_reading.sequence,
+                    value: sensor_reading.value,
+                    drift: sensor_reading.drift,
+                    timestamp: sensor_reading.timestamp,
+                })
+                .collect();
+
+            let compressed_payload = CompressedPayload // previous maps array to CompressedPayload
+            {
+                packet_id,
+                reading_count: compressed_readings.len(),
+                created_at: simulation_elapsed(&simulation_start_time),
+                readings: compressed_readings,
+            };
+
+            // Serialize compressed payload
+            let payload = serde_json::to_string(&compressed_payload).unwrap();
  
             // Simulated 50% compression ratio, rounding down to at least 1 byte 
             let compressed_size_bytes = (payload.len() / 2).max(1);
@@ -1147,6 +1152,7 @@ fn data_compression_task(priority_buffer: Shared<PriorityBuffer>, downlink_queue
             downlink_queue.lock().unwrap().push(DataPacket
             {
                 packet_id,
+                reading_count: sensor_batch.len(),
                 payload: payload,
                 created_at: simulation_elapsed(&simulation_start_time),
                 size_bytes: compressed_size_bytes,
@@ -1209,7 +1215,7 @@ fn antenna_alignment_task(metrics: Shared<SystemMetrics>, state: Shared<SystemSt
             return;
         }
  
-        // Preemption check: skip if emergency or abort
+        // Preemption check: skip if emergency or abort (Emergency = caused by Thermal Control, Abort = caused by Fault Injection)
         if *emergency.lock().unwrap() || *state.lock().unwrap() == SystemState::MissionAbort
         {
             // Append to console, log and deadline (metrics)
@@ -1307,26 +1313,6 @@ fn downlink_thread(downlink_queue: Shared<Vec<DataPacket>>, metrics: Shared<Syst
             simulation_elapsed(&simulation_start_time)
         );
         append_log(&log, &line);
- 
-        // Check if the downlink queue is overflowing -> Degraded
-        let queue_fill_ratio = downlink_queue.lock().unwrap().len() as f32 / PRIORITY_BUFFER as f32;
-        // FIXME: move to health? why here
-        if queue_fill_ratio >= DEGRADED_MODE
-        {
-            let mut system_state = state.lock().unwrap();
- 
-            if *system_state == SystemState::Normal
-            {
-                let line = format!
-                (
-                    "[{}ms] [Downlink] Queue >= 80% → DEGRADED",
-                    simulation_elapsed(&simulation_start_time)
-                );
- 
-                append_log(&log, &line);
-                *system_state = SystemState::Degraded;
-            }
-        }
  
         // Typestate transition = Radio<Idle> -> Radio<Transmitting>
         let radio = Radio::<Idle>::new();
@@ -1742,7 +1728,7 @@ fn main()
     append_log(&log, "[OCS] All OCS threads and RM tasks are online.");
 
     // Run for the Simulation Duration
-    thread::sleep(Duration::from_secs(SIMULATION_DURATION));
+    thread::sleep(Duration::from_millis(SIMULATION_DURATION));
 
     // Own version of Graceful Shutdown (Hard RTS)
     println!("\n[OCS] Simulation ended — signalling shutdown...");

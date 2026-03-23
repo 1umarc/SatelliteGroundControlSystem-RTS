@@ -69,26 +69,26 @@ const LOG_FILE: &str = "gcs.log";
 #[derive(Serialize, Deserialize, Debug)]
 enum OCSMessage 
 {
-    Thermal
-    {
-        sequence: u64,
-        temperature: f64,
-        drift: i64,
-    },
+    // Thermal
+    // {
+    //     sequence: u64,
+    //     temperature: f64,
+    //     drift: i64,
+    // },
  
-    Accelerometer
-    {
-        sequence: u64,
-        velocity: f64,
-        drift: i64,
-    },
+    // Accelerometer
+    // {
+    //     sequence: u64,
+    //     velocity: f64,
+    //     drift: i64,
+    // },
  
-    Gyroscope
-    {
-        sequence: u64,
-        orientation: f64,
-        drift: i64,
-    },
+    // Gyroscope
+    // {
+    //     sequence: u64,
+    //     orientation: f64,
+    //     drift: i64,
+    // },
  
     Status
     {
@@ -100,9 +100,11 @@ enum OCSMessage
  
     Downlink
     {
-        packet: u64,
+        packet_id: u64,
+        reading_count: usize,
         bytes: usize,
         queue_latency: u64,
+        payload: String,
     },
 
     // CHANGED: Alert fields are now inline to match the OCS wire format exactly.
@@ -201,6 +203,24 @@ fn dispatch_command(normal_mode: &GCSMode<Normal>, command_sender: &mpsc::Sender
 // ===============
 // Data Types
 // ===============
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct CompressedReading
+{
+    sensor_type: String,
+    sequence: u64,
+    value: f64,
+    drift: i64,
+    timestamp: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct CompressedPayload
+{
+    packet_id: u64,
+    reading_count: usize,
+    created_at: u64,
+    readings: Vec<CompressedReading>,
+}
 
 // Represents one raw packet we just received from the OCS
 #[derive(Debug)]
@@ -578,27 +598,7 @@ async fn telemetry_processor_task(mut receiver: mpsc::Receiver<IncomingPacket>, 
                         handle_ocs_alert(&message, &state, &metrics, &command_sender, &logger, &simulation_start);
                         continue;  // alerts don't count toward normal telemetry metrics
                     }
- 
-                    // =============
-                    // Thermal Message
-                    // =============
-                    OCSMessage::Thermal {sequence, temperature, drift} =>
-                    {
-                        write_log(&logger, &format!("[{}ms] [Telemetry Receiver] thermal sequence={sequence}  temperature={temperature:.2}°C  drift={:+}ms  decode={}µs", simulation_elapsed(&simulation_start), drift, decode_time));
 
-                        let mut gcs_state = state.lock().unwrap();
-
-                        gcs_state.thermal_misses = 0;  // reset miss counter — we got data
-                        gcs_state.last_thermal = simulation_elapsed(&simulation_start);
-
-                        if gcs_state.loss_of_contact
-                        {
-                            gcs_state.loss_of_contact = false;
-
-                            print_and_log(&logger, &format!("[{}ms] [Telemetry Receiver] Thermal contact restored.", simulation_elapsed(&simulation_start)));
-                        }
-                    }
- 
                     // =============
                     // Status Message
                     // =============
@@ -619,55 +619,181 @@ async fn telemetry_processor_task(mut receiver: mpsc::Receiver<IncomingPacket>, 
                         }
                     }
  
-                    // =============
-                    // Accelerometer Message
-                    // =============
-                    OCSMessage::Accelerometer {sequence, velocity, drift} =>
-                    {
-                        write_log(&logger, &format!("[{}ms] [Telemetry Receiver] accelerometer   sequence={sequence}  velocity={velocity:.4}  drift={}ms  decode={}µs", simulation_elapsed(&simulation_start), drift, decode_time));
+                    // // =============
+                    // // Thermal Message
+                    // // =============
+                    // OCSMessage::Thermal {sequence, temperature, drift} =>
+                    // {
+                    //     write_log(&logger, &format!("[{}ms] [Telemetry Receiver] thermal sequence={sequence}  temperature={temperature:.2}°C  drift={:+}ms  decode={}µs", simulation_elapsed(&simulation_start), drift, decode_time));
 
-                        let mut gcs_state = state.lock().unwrap();
+                    //     let mut gcs_state = state.lock().unwrap();
 
-                        gcs_state.accelerometer_misses = 0;
-                        gcs_state.last_accelerometer = simulation_elapsed(&simulation_start);
+                    //     gcs_state.thermal_misses = 0;  // reset miss counter — we got data
+                    //     gcs_state.last_thermal = simulation_elapsed(&simulation_start);
 
-                        if gcs_state.loss_of_contact
-                        {
-                            gcs_state.loss_of_contact = false;
-                        }
-                    }
+                    //     if gcs_state.loss_of_contact
+                    //     {
+                    //         gcs_state.loss_of_contact = false;
+
+                    //         print_and_log(&logger, &format!("[{}ms] [Telemetry Receiver] Thermal contact restored.", simulation_elapsed(&simulation_start)));
+                    //     }
+                    // }
  
-                    // =============
-                    // Gyroscope Message
-                    // =============
-                    OCSMessage::Gyroscope {sequence, orientation, drift} =>
-                    {
-                        write_log(&logger, &format!("[{}ms] [Telemetry Receiver] gyroscope    sequence={sequence}  orientation={orientation:.4}  drift={}  decode={}µs", simulation_elapsed(&simulation_start), drift,decode_time));
 
-                        let mut gcs_state = state.lock().unwrap();
+ 
+                    // // =============
+                    // // Accelerometer Message
+                    // // =============
+                    // OCSMessage::Accelerometer {sequence, velocity, drift} =>
+                    // {
+                    //     write_log(&logger, &format!("[{}ms] [Telemetry Receiver] accelerometer   sequence={sequence}  velocity={velocity:.4}  drift={}ms  decode={}µs", simulation_elapsed(&simulation_start), drift, decode_time));
 
-                        gcs_state.gyroscope_misses = 0;
-                        gcs_state.last_gyroscope   = simulation_elapsed(&simulation_start);
+                    //     let mut gcs_state = state.lock().unwrap();
 
-                        if gcs_state.loss_of_contact
-                        {
-                            gcs_state.loss_of_contact = false;
-                        }
-                    }
+                    //     gcs_state.accelerometer_misses = 0;
+                    //     gcs_state.last_accelerometer = simulation_elapsed(&simulation_start);
+
+                    //     if gcs_state.loss_of_contact
+                    //     {
+                    //         gcs_state.loss_of_contact = false;
+                    //     }
+                    // }
+ 
+                    // // =============
+                    // // Gyroscope Message
+                    // // =============
+                    // OCSMessage::Gyroscope {sequence, orientation, drift} =>
+                    // {
+                    //     write_log(&logger, &format!("[{}ms] [Telemetry Receiver] gyroscope    sequence={sequence}  orientation={orientation:.4}  drift={}  decode={}µs", simulation_elapsed(&simulation_start), drift,decode_time));
+
+                    //     let mut gcs_state = state.lock().unwrap();
+
+                    //     gcs_state.gyroscope_misses = 0;
+                    //     gcs_state.last_gyroscope   = simulation_elapsed(&simulation_start);
+
+                    //     if gcs_state.loss_of_contact
+                    //     {
+                    //         gcs_state.loss_of_contact = false;
+                    //     }
+                    // }
  
                     // =============
                     // Downlink Message
                     // =============
-                    OCSMessage::Downlink {packet, bytes, queue_latency} =>
+                    OCSMessage::Downlink {    packet_id,
+    reading_count,
+    bytes,
+    queue_latency,
+    payload,} =>
                     {
-                        write_log(&logger, &format!("[{}ms] [Telemetry Receiver] downlink packet={packet}  {bytes}B  queue_latency={queue_latency}ms  decode={decode_time}µs", simulation_elapsed(&simulation_start)));
+                        write_log(&logger, &format!("[{}ms] [Telemetry Receiver] downlink packet={}  {} bytes  queue_latency={}ms  decode={}µs",          simulation_elapsed(&simulation_start),
+            packet_id,
+            reading_count,
+            bytes,
+            queue_latency,
+            decode_time);
 
-                        let mut gcs_state = state.lock().unwrap();
+                    let compressed_payload = match serde_json::from_str::<CompressedPayload>(payload)
+                    {
+                        Ok(parsed_payload) => parsed_payload,
+                        Err(error) =>
+                        {
+                            write_log
+                            (
+                                &logger,
+                                &format!
+                                (
+                                    "[{}ms] [Telemetry Receiver] downlink payload parse fail: {}",
+                                    simulation_elapsed(&simulation_start),
+                                    error
+                                )
+                            );
+                            continue;
+                        }
+                    };
 
-                        gcs_state.accelerometer_misses = 0;
-                        gcs_state.last_accelerometer = simulation_elapsed(&simulation_start);
+                    let mut gcs_state = state.lock().unwrap();
 
-                        if gcs_state.loss_of_contact {gcs_state.loss_of_contact = false;}
+                    for reading in &compressed_payload.readings
+                    {
+                        match reading.sensor_type.as_str()
+                        {
+                            "Thermal" =>
+                            {
+                                write_log
+                                (
+                                    &logger,
+                                    &format!
+                                    (
+                                        "[{}ms] [Telemetry Receiver] thermal sequence={}  temperature={:.2}C  drift={:+}ms",
+                                        simulation_elapsed(&simulation_start),
+                                        reading.sequence,
+                                        reading.value,
+                                        reading.drift
+                                    )
+                                );
+
+                                gcs_state.thermal_misses = 0;
+                                gcs_state.last_thermal = simulation_elapsed(&simulation_start);
+                            }
+
+                            "Accelerometer" =>
+                            {
+                                write_log
+                                (
+                                    &logger,
+                                    &format!
+                                    (
+                                        "[{}ms] [Telemetry Receiver] accelerometer sequence={}  velocity={:.4}  drift={:+}ms",
+                                        simulation_elapsed(&simulation_start),
+                                        reading.sequence,
+                                        reading.value,
+                                        reading.drift
+                                    )
+                                );
+
+                                gcs_state.accelerometer_misses = 0;
+                                gcs_state.last_accelerometer = simulation_elapsed(&simulation_start);
+                            }
+
+                            "Gyroscope" =>
+                            {
+                                write_log
+                                (
+                                    &logger,
+                                    &format!
+                                    (
+                                        "[{}ms] [Telemetry Receiver] gyroscope sequence={}  orientation={:.4}  drift={:+}ms",
+                                        simulation_elapsed(&simulation_start),
+                                        reading.sequence,
+                                        reading.value,
+                                        reading.drift
+                                    )
+                                );
+
+                                gcs_state.gyroscope_misses = 0;
+                                gcs_state.last_gyroscope = simulation_elapsed(&simulation_start);
+                            }
+
+                            other =>
+                            {
+                                write_log
+                                (
+                                    &logger,
+                                    &format!
+                                    (
+                                        "[{}ms] [Telemetry Receiver] unknown sensor type in downlink: {}",
+                                        simulation_elapsed(&simulation_start),
+                                        other
+                                    )
+                                );
+                            }
+                        }
+                    }
+
+                    if gcs_state.loss_of_contact
+                    {
+                        gcs_state.loss_of_contact = false;
                     }
                 }
  
