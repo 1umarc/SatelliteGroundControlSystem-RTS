@@ -864,8 +864,8 @@ fn thermal_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<Syste
 // 11. ---- ACCELEROMETER THREAD ----
 fn accelerometer_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<SystemMetrics>, state: Shared<SystemState>, running: Shared<bool>, log: Shared<File>, simulation_start_time: Instant)
 {
-    #[cfg(windows)]
-    unsafe {winapi::um::processthreadsapi::SetThreadPriority(winapi::um::processthreadsapi::GetCurrentThread(), winapi::um::winbase::THREAD_PRIORITY_HIGHEST as i32,);}
+    //#[cfg(windows)]
+   //unsafe {winapi::um::processthreadsapi::SetThreadPriority(winapi::um::processthreadsapi::GetCurrentThread(), winapi::um::winbase::THREAD_PRIORITY_ABOVE_NORMAL as i32,);}
 
     let log_line = format!
     (
@@ -957,8 +957,8 @@ fn accelerometer_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared
 // 12. ---- GYROSCOPE THREAD ----
 fn gyroscope_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<SystemMetrics>, state: Shared<SystemState>, running: Shared<bool>, log: Shared<File>, simulation_start_time: Instant)
 {
-    #[cfg(windows)]
-    unsafe {winapi::um::processthreadsapi::SetThreadPriority(winapi::um::processthreadsapi::GetCurrentThread(), winapi::um::winbase::THREAD_PRIORITY_HIGHEST as i32,);}
+    //#[cfg(windows)]
+    //unsafe {winapi::um::processthreadsapi::SetThreadPriority(winapi::um::processthreadsapi::GetCurrentThread(), winapi::um::winbase::THREAD_PRIORITY_ABOVE_NORMAL as i32,);}
 
     let log_line = format!
     (
@@ -1604,6 +1604,7 @@ fn print_final_report(metrics: &SystemMetrics)
         println!("|    ... and {} more", metrics.deadline_log.len() - 5 // print the number of violations minus the 5 already printed
         );
     }
+    println!("|  Deadlines Met (%): {:.2}%", 100.0 - (metrics.deadline_log.len() as f64 / metrics.drift.len() as f64 * 100.0));
 
     println!("|  Faults: {}", metrics.fault_log.len()); // print the number of faults
 

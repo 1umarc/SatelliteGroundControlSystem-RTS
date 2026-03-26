@@ -1259,6 +1259,7 @@ fn print_report(metric: &GCSMetrics, state: &GCSState)
     {
         println!("|    ... and {} more", metric.deadline_violations.len() - 3);
     }
+        println!("|  Deadlines Met (%): {:.2}%", 100.0 - (metric.deadline_violations.len() as f64 / metric.drift.len() as f64  * 100.0));
     if !metric.rejection_log.is_empty()
     {
         println!("|  Rejections: {}", metric.rejection_log.len());
@@ -1295,7 +1296,7 @@ async fn main()
 
     // Create the log file
     let logger = create_logger();
-    println!("[GCS] log → {LOG_FILE}");
+    println!("[GCS] log -> {LOG_FILE}");
 
     // Shared state — wrapped in Arc<Mutex<>> so multiple async tasks can access them safely
     let state   = Arc::new(Mutex::new(GCSState::default()));
