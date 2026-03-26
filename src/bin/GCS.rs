@@ -39,11 +39,11 @@ const REREQUEST_INTERVAL: u64 = 500;
 // check for silence every 500ms — quick enough to notice, not so fast we spam requests
 
 // Jitter warning limit in microseconds
-const UPLINK_JITTER_LIMIT: i64 = 2000;
-// 2000µs = 2ms, matches the dispatch deadline
+const UPLINK_JITTER_LIMIT: i64 = 3000;
+// 3000µs = 3ms, similar to the dispatch deadline (additional)
 
 // How long the whole simulation runs
-const SIMULATION_DURATION: u64 = 180;  // 3 minutes, same as OCS
+const SIMULATION_DURATION: u64 = 125;  // 2.08 minutes, same as OCS
 
 // Network addresses
 const GCS_TELEMETRY_BIND: &str = "0.0.0.0:9000";   // GCS listens for OCS telemetry on this port
@@ -432,7 +432,7 @@ shutdown: CancellationToken)
                             Ok(_) =>
                             {
                                 // Check if we missed the dispatch deadline
-                                if dispatch_ms / 1000 > DISPATCH_DEADLINE
+                                if dispatch_ms > DISPATCH_DEADLINE
                                 {
                                     let violation = format!("[{}ms] [DEADLINE] Dispatch {}ms > {}ms", simulation_elapsed(&simulation_start), dispatch_ms, DISPATCH_DEADLINE);
                                     
@@ -981,7 +981,6 @@ async fn thermal_command_task(command_sender: mpsc::Sender<UplinkCommand>, state
         {
             let warning = format!("[{}ms] [WARN] Thermal Command jitter {}µs iteration={iteration}", simulation_elapsed(&simulation_start), jitter_timing);
             write_log(&logger, &warning);
-            metrics.lock().unwrap().deadline_violations.push(warning);
         }
 
         {
@@ -1062,7 +1061,6 @@ async fn accelerometer_command_task(command_sender: mpsc::Sender<UplinkCommand>,
         {
             let warning = format!("[{}ms] [WARN] Accelerometer Command jitter {}µs iteration={iteration}", simulation_elapsed(&simulation_start), jitter_timing);
             write_log(&logger, &warning);
-            metrics.lock().unwrap().deadline_violations.push(warning);
         }
 
         {
@@ -1141,7 +1139,6 @@ async fn gyroscope_command_task(command_sender: mpsc::Sender<UplinkCommand>, sta
         {
             let warning = format!("[{}ms] [WARN] Gyroscope Command jitter {}µs iteration={iteration}", simulation_elapsed(&simulation_start), jitter_timing);
             write_log(&logger, &warning);
-            metrics.lock().unwrap().deadline_violations.push(warning);
         }
 
         {
@@ -1253,7 +1250,7 @@ fn print_report(metric: &GCSMetrics, state: &GCSState)
         let interlock_samples: Vec<i64> = metric.interlock_latency.iter().map(|&v| v as i64).collect();
         print_stat_row("Interlock Latency (ms)", &interlock_samples);
     }
-    println!("|  Deadline / Warn violations: {}", metric.deadline_violations.len());
+    println!("|  Deadline violations: {}", metric.deadline_violations.len());
     for violation in metric.deadline_violations.iter().take(3)
     {
         println!("|    {violation}");

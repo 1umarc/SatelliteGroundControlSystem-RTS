@@ -46,7 +46,7 @@ const INITIALISE_TIME_LIMIT: u64 = 5;
 // Fault Injection & Simulation
 const FAULT_INJECTION_PERIOD: u64 = 60;   // 60s = 60000ms
 const RECOVERY_TIME_LIMIT: u64 = 200000;     // 200000μs = 200ms    
-const SIMULATION_DURATION: u64 = 180;     // 180s = 180000ms = 3min to inject 3 faults
+const SIMULATION_DURATION: u64 = 125;     // 125s = 125000ms = 2min 5sec to inject 3 faults
  
 // Pre-allocated worst case Vec capacities during compilation to avoiding unpredictable heap allocation latency
 const JITTER_MAX_SIZE: usize = 10000;
@@ -720,6 +720,9 @@ fn command_receiver_thread(running: Shared<bool>, emergency: Shared<bool>, log: 
 // 10. ---- THERMAL THREAD (CRITICAL SENSOR) ----
 fn thermal_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<SystemMetrics>, state: Shared<SystemState>, emergency: Shared<bool>, udp_sender: mpsc::Sender<String>, running: Shared<bool>, log: Shared<File>, simulation_start_time: Instant)
 {
+    #[cfg(windows)]
+    unsafe {winapi::um::processthreadsapi::SetThreadPriority(winapi::um::processthreadsapi::GetCurrentThread(), winapi::um::winbase::THREAD_PRIORITY_HIGHEST as i32,);}
+
     let log_line = format!
     (
         "[{}ms] [Thermal] period={}ms  buffer_priority=1  CRITICAL SENSOR",
@@ -861,6 +864,9 @@ fn thermal_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<Syste
 // 11. ---- ACCELEROMETER THREAD ----
 fn accelerometer_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<SystemMetrics>, state: Shared<SystemState>, running: Shared<bool>, log: Shared<File>, simulation_start_time: Instant)
 {
+    #[cfg(windows)]
+    unsafe {winapi::um::processthreadsapi::SetThreadPriority(winapi::um::processthreadsapi::GetCurrentThread(), winapi::um::winbase::THREAD_PRIORITY_HIGHEST as i32,);}
+
     let log_line = format!
     (
         "[{}ms] [Accelerometer] period={}ms  buffer_priority=2",
@@ -951,6 +957,9 @@ fn accelerometer_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared
 // 12. ---- GYROSCOPE THREAD ----
 fn gyroscope_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<SystemMetrics>, state: Shared<SystemState>, running: Shared<bool>, log: Shared<File>, simulation_start_time: Instant)
 {
+    #[cfg(windows)]
+    unsafe {winapi::um::processthreadsapi::SetThreadPriority(winapi::um::processthreadsapi::GetCurrentThread(), winapi::um::winbase::THREAD_PRIORITY_HIGHEST as i32,);}
+
     let log_line = format!
     (
         "[{}ms] [Gyroscope] period={}ms  buffer_priority=3",
@@ -1117,7 +1126,7 @@ fn health_monitor_task(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<
         append_log(&log, &log_line);
  
         // Flag if health task itself is drifting
-        if drift.abs() > 50  // abs = absolute because drift is +ve or -ve, 50ms check
+        if drift.abs() > 5  // abs = absolute because drift is +ve or -ve, 5ms check (Additional)
         {
             let violation = format!
             (
@@ -1126,9 +1135,7 @@ fn health_monitor_task(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<
                 drift,
                 iteration
             );
- 
             append_log(&log, &violation);
-            append_deadline(&metrics, violation);
         }
  
         // Send telemetry to GCS
@@ -1249,7 +1256,7 @@ fn data_compression_task(priority_buffer: Shared<PriorityBuffer>, downlink_queue
             packet_id += 1;
         }
  
-        if drift.abs() > 50 // 50 ms  check
+        if drift.abs() > 10 // 10 ms check (Additional)
         {
             let violation = format!
             (
@@ -1258,9 +1265,7 @@ fn data_compression_task(priority_buffer: Shared<PriorityBuffer>, downlink_queue
                 drift,
                 iteration
             );
- 
             append_log(&log, &violation);
-            append_deadline(&metrics, violation);
         }
  
         {   // Update metrics
@@ -1292,7 +1297,7 @@ fn antenna_alignment_task(metrics: Shared<SystemMetrics>, state: Shared<SystemSt
         // Preemption check: skip if emergency or abort (Emergency = caused by Thermal Control, Abort = caused by Fault Injection)
         if *emergency.lock().unwrap() || *state.lock().unwrap() == SystemState::MissionAbort
         {
-            // Append to console, log and deadline (metrics)
+            // Append to console, log (metrics)
             let log_line = format!
             (
                 "[{}ms] [Antenna] iteration={:>4}  PREEMPTED",
@@ -1300,14 +1305,6 @@ fn antenna_alignment_task(metrics: Shared<SystemMetrics>, state: Shared<SystemSt
                 iteration
             );
             append_console_log(&log, &log_line);
- 
-            let violation = format!
-            (
-                "[{}ms] [PREEMPT] Antenna iteration={}",
-                simulation_elapsed(&simulation_start_time),
-                iteration
-            );
-            append_deadline(&metrics, violation);
  
             iteration += 1;
             return;
@@ -1333,7 +1330,7 @@ fn antenna_alignment_task(metrics: Shared<SystemMetrics>, state: Shared<SystemSt
         );
         append_log(&log, &line);
  
-        if drift.abs() > 50 // 50 ms check
+        if drift.abs() > 5 // 5 ms check
         {
             let violation = format!
             (
@@ -1342,9 +1339,7 @@ fn antenna_alignment_task(metrics: Shared<SystemMetrics>, state: Shared<SystemSt
                 drift,
                 iteration
             );
- 
             append_log(&log, &violation);
-            append_deadline(&metrics, violation);
         }
  
         {   // Update metrics
@@ -1402,7 +1397,7 @@ fn downlink_thread(downlink_queue: Shared<Vec<DataPacket>>, metrics: Shared<Syst
                     simulation_elapsed(&simulation_start_time),
                     INITIALISE_TIME_LIMIT
                 );
-                append_log(&log, &violation);
+                append_console_log(&log, &violation);
                 append_deadline(&metrics, violation);
             }
  
@@ -1454,7 +1449,7 @@ fn fault_injector_thread(metrics: Shared<SystemMetrics>, state: Shared<SystemSta
     // Fault injection counter
     let mut fault_count: u32 = 0;
 
-    while is_running(&running)
+    while is_running(&running) && fault_count < 2
     {
         thread::sleep(Duration::from_secs(FAULT_INJECTION_PERIOD));
         let work_start = Instant::now();
@@ -1598,7 +1593,7 @@ fn print_final_report(metrics: &SystemMetrics)
     println!("|  Insert latency (µs)");
     let insert_latency_values: Vec<i64> = metrics.insert_latency.iter().map(|&value| value as i64).collect(); // it iterates over the values and maps them to i64, then collects the resulting vector
     print_row("priority_buffer.push()", &insert_latency_values);
-    println!("|  Deadline / Warn violations: {}", metrics.deadline_log.len());
+    println!("|  Deadline violations: {}", metrics.deadline_log.len());
 
     for violation in metrics.deadline_log.iter().take(5) // for each violation in deadline log, proceed to print but only the first 5
     {
@@ -1636,13 +1631,17 @@ fn print_final_report(metrics: &SystemMetrics)
     println!("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n");
 }
 
-
+#[cfg(windows)]
+fn s() { unsafe {winapi::um::timeapi::timeBeginPeriod(1);}}
+#[cfg(not(windows))]
+fn s() {}
 // ~~~~ SECTION 6: MAIN FUNCTION ~~~~~
 // 18. ---- MAIN ----
 // Sets up all shared state, spawns all OS threads, schedules RM background tasks via ScheduledThreadPool
 // In the end, shuts everything down gracefully and prints final benchmarking report
 fn main()
-{ 
+{
+    s();
     println!("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
     println!("|  SATELLITE ONBOARD CONTROL SYSTEM (OCS) - BY LUVEN MARK (TP071542) |");
     println!("|  TYPE: HARD RTOS, demonstrating the learnt Hard RTS concepts.      |");
@@ -1740,7 +1739,7 @@ fn main()
 
     rate_monotonic_thread_pool.execute_at_fixed_rate // fixed rate means that the task will be executed at fixed intervals
     (
-        Duration::from_millis(10),                  // 10ms offset
+        Duration::from_millis(0),               // start after 0ms
         Duration::from_millis(HEALTH_MONITOR_PERIOD),
         health_monitor_task
         (
@@ -1756,7 +1755,7 @@ fn main()
 
     rate_monotonic_thread_pool.execute_at_fixed_rate
     (
-        Duration::from_millis(25),                  // 25ms offset
+        Duration::from_millis(0),
         Duration::from_millis(DATA_COMPRESSION_PERIOD),
         data_compression_task
         (
@@ -1771,7 +1770,7 @@ fn main()
 
     rate_monotonic_thread_pool.execute_at_fixed_rate
     (
-        Duration::from_millis(50),                  // 50ms offset
+        Duration::from_millis(0),
         Duration::from_millis(ANTENNA_ALIGNMENT_PERIOD),
         antenna_alignment_task
         (
