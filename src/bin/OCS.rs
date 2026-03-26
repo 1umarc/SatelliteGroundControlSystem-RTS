@@ -1,5 +1,5 @@
 // SATELLITE ONBOARD CONTROL SYSTEM - BY LUVEN MARK (TP071542)
-// TYPE: HARD RTS, demonstrating the learnt Hard RTS concepts
+// TYPE: HARD RTOS, demonstrating the learnt Hard RTS concepts
 
 // Standard Library Imports
 use std::collections::BinaryHeap;   // for priority queue
@@ -344,7 +344,7 @@ impl Radio<Transmitting>
 
 // 4. ---- SYSTEM METRICS ----
 
-// System Metrics for Final Report
+// System Metrics for Final Benchmarking Report
 struct SystemMetrics
 {
     // Jitter Samples per sensor (μs), where Jitter = |actual - expected|
@@ -1559,8 +1559,8 @@ fn fault_injector_thread(metrics: Shared<SystemMetrics>, state: Shared<SystemSta
 }
  
 
-// ~~~~ SECTION 5: FINAL METRICS REPORT ~~~~~
-// 18. ---- FINAL REPORT ----
+// ~~~~ SECTION 5: FINAL BENCHMARKING REPORT ~~~~~
+// 18. ---- FINAL BENCHMARKING REPORT ----
 fn print_final_report(metrics: &SystemMetrics)
 {
     // Calculate packet loss percentage
@@ -1586,7 +1586,7 @@ fn print_final_report(metrics: &SystemMetrics)
     }
  
     println!("\n~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
-    println!("|              OCS FINAL REPORT - BY LUVEN MARK (TP071542)                                    |");
+    println!("|              OCS FINAL BENCHMARKING REPORT - BY LUVEN MARK (TP071542)                        |");
     println!("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
     println!("|  Sensor Readings Received: {}  Sensor Readings Dropped: {} ({:.2}%)", metrics.total_received, metrics.total_dropped, packet_loss); // .2 = 2 decimal places
     println!("|  Jitter (µs)  limit={}µs", THERMAL_JITTER_TIME_LIMIT);
@@ -1640,12 +1640,12 @@ fn print_final_report(metrics: &SystemMetrics)
 // ~~~~ SECTION 6: MAIN FUNCTION ~~~~~
 // 18. ---- MAIN ----
 // Sets up all shared state, spawns all OS threads, schedules RM background tasks via ScheduledThreadPool
-// In the end, shuts everything down gracefully and prints final report
+// In the end, shuts everything down gracefully and prints final benchmarking report
 fn main()
 { 
     println!("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
     println!("|  SATELLITE ONBOARD CONTROL SYSTEM (OCS) - BY LUVEN MARK (TP071542) |");
-    println!("|  TYPE: HARD RTS, demonstrating the learnt Hard RTS concepts.       |");
+    println!("|  TYPE: HARD RTOS, demonstrating the learnt Hard RTS concepts.      |");
     println!("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
 
     // Initialization
@@ -1839,13 +1839,13 @@ fn main()
     }
     append_log(&log, "[OCS] All OCS threads joined successfully.");
 
-    // Final Report 
-    println!("\n[OCS] FINAL REPORT:");
-    {   // Lock and print final report
+    // Final Benchmarking Report 
+    println!("\n[OCS] FINAL BENCHMARKING REPORT:");
+    {   // Lock and print final benchmarking report
         let metrics_lock = shared_system_metrics.lock().unwrap();
         print_final_report(&metrics_lock);
     }
 
-    append_log(&log, "[OCS] Final report generated.");
+    append_log(&log, "[OCS] Final benchmarking report generated.");
     println!("[OCS] System Shutdown Complete.");    // Main Thread exits
 }

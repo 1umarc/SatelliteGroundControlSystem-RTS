@@ -235,7 +235,7 @@ struct GCSMetrics
 
     // CPU and scheduling drift
     drift: Vec<i64>,  // difference between expected vs actual task start times
-    active_time: u64,       // total ms the tasks were actually doing work
+    active_time: u64,       // total µs the tasks were actually doing work
     elapsed_time: u64,       // total ms the simulation has been running
 
     // Backlog tracking
@@ -425,15 +425,16 @@ shutdown: CancellationToken)
                     {
                         // Measure how long the command waited in the queue before being sent
                         let dispatch = command.created_at.elapsed().as_micros() as u64;
+                        let dispatch_ms = dispatch / 1000;
 
                         match socket.send_to(command.payload.as_bytes(), OCS_COMMAND_ADDRESS).await
                         {
                             Ok(_) =>
                             {
                                 // Check if we missed the dispatch deadline
-                                if dispatch / 1000 > DISPATCH_DEADLINE
+                                if dispatch_ms / 1000 > DISPATCH_DEADLINE
                                 {
-                                    let violation = format!("[{}ms] [DEADLINE] Dispatch {}µs > {}ms", simulation_elapsed(&simulation_start), dispatch, DISPATCH_DEADLINE);
+                                    let violation = format!("[{}ms] [DEADLINE] Dispatch {}ms > {}ms", simulation_elapsed(&simulation_start), dispatch_ms, DISPATCH_DEADLINE);
                                     
                                     print_and_log(&logger, &violation);
                                     metrics.lock().unwrap().deadline_violations.push(violation);
@@ -987,7 +988,7 @@ async fn thermal_command_task(command_sender: mpsc::Sender<UplinkCommand>, state
             let mut metric = metrics.lock().unwrap();
             metric.thermal_jitter.push(jitter_timing);
             metric.drift.push(drift);
-            metric.active_time  += loop_start.elapsed().as_millis() as u64;
+            metric.active_time  += loop_start.elapsed().as_micros() as u64;
             metric.elapsed_time  = task_start.elapsed().as_millis() as u64; // kept here — Thermal runs most often so it tracks sim time accurately
         }
 
@@ -1056,7 +1057,7 @@ async fn accelerometer_command_task(command_sender: mpsc::Sender<UplinkCommand>,
         dispatch_command(&normal_mode, &command_sender, payload); // RM-P2
 
         // FIX: jitter warning was missing from Accelerometer — added to match Thermal and Gyroscope.
-        // Without this, any jitter spike here is silently dropped and never reaches the final report.
+        // Without this, any jitter spike here is silently dropped and never reaches the final benchmarking report.
         if jitter_timing > UPLINK_JITTER_LIMIT
         {
             let warning = format!("[{}ms] [WARN] Accelerometer Command jitter {}µs iteration={iteration}", simulation_elapsed(&simulation_start), jitter_timing);
@@ -1068,7 +1069,7 @@ async fn accelerometer_command_task(command_sender: mpsc::Sender<UplinkCommand>,
             let mut metric = metrics.lock().unwrap();
             metric.accelerometer_jitter.push(jitter_timing);
             metric.drift.push(drift);
-            metric.active_time += loop_start.elapsed().as_millis() as u64;
+            metric.active_time += loop_start.elapsed().as_micros() as u64;
         }
 
         // Log every 8 iterations — 120ms period means every ~1 second
@@ -1147,7 +1148,7 @@ async fn gyroscope_command_task(command_sender: mpsc::Sender<UplinkCommand>, sta
             let mut metric = metrics.lock().unwrap();
             metric.gyroscope_jitter.push(jitter_timing);
             metric.drift.push(drift);
-            metric.active_time += loop_start.elapsed().as_millis() as u64;
+            metric.active_time += loop_start.elapsed().as_micros() as u64;
         }
 
         // Log every 5 iterations — 333ms period means every ~1.6 seconds
@@ -1162,7 +1163,7 @@ async fn gyroscope_command_task(command_sender: mpsc::Sender<UplinkCommand>, sta
 
 // ===============
 // Task 5: Metrics Reporter
-// Snapshots the backlog depth every 10 seconds for the final report
+// Snapshots the backlog depth every 10 seconds for the final benchmarking report
 // ===============
 async fn metrics_reporter_task(metrics: Shared<GCSMetrics>, _: Shared<GCSState>, backlog_counter: Shared<usize>, _: Shared<File>, _simulation_start: Instant, shutdown: CancellationToken)
 {
@@ -1183,27 +1184,35 @@ async fn metrics_reporter_task(metrics: Shared<GCSMetrics>, _: Shared<GCSState>,
 }
 
 // ===============
-// Final Report — printed at the end of the simulation
+// Final Benchmarking Report — printed at the end of the simulation
 // ===============
 fn print_report(metric: &GCSMetrics, state: &GCSState)
 {
     // Calculate command rejection percentage
-    let reject_percentage = if metric.commands_sent + metric.commands_rejected > 0
+    let reject_percentage;
+    if metric.commands_sent + metric.commands_rejected > 0
     {
-        metric.commands_rejected as f64 / (metric.commands_sent + metric.commands_rejected) as f64 * 100.0
+        reject_percentage = metric.commands_rejected as f64 / (metric.commands_sent + metric.commands_rejected) as f64 * 100.0
     }
-    else {0.0};
+    else 
+    {
+        reject_percentage = 0.0
+    }
 
     // Rough CPU estimate: how much of the elapsed time were tasks actually active?
-    let cpu_estimate = if metric.elapsed_time > 0
+    let cpu_estimate;
+    if metric.elapsed_time > 0
     {
-        metric.active_time as f64 / metric.elapsed_time as f64 * 100.0
+        cpu_estimate = metric.active_time as f64 / (metric.elapsed_time as f64 * 1000.0) * 100.0
     }
-    else {0.0};
+    else 
+    {
+        cpu_estimate = 0.0
+    }
 
 
     println!("\n|==============================================================================================|");
-    println!( "|                            GCS FINAL REPORT - BY CHONG CHUN KIT (TP077436)                   |");
+    println!( "|               GCS FINAL BENCHMARKING REPORT - BY CHONG CHUN KIT (TP077436)                   |");
     println!( "|==============================================================================================|");
     println!(
         "|  Mode: {} ",
@@ -1363,7 +1372,7 @@ async fn main()
     sleep(Duration::from_millis(500)).await;
 
     // Print the final summary
-    println!("\n[GCS] FINAL REPORT:");
+    println!("\n[GCS] FINAL BENCHMARKING REPORT:");
     print_report(&metrics.lock().unwrap(), &state.lock().unwrap());
     println!("[GCS] Done.  Full event log -> {LOG_FILE}");
 }
