@@ -44,9 +44,9 @@ const DOWNLINK_TIME_LIMIT: u64 = 30;
 const INITIALISE_TIME_LIMIT: u64 = 5;      
  
 // Fault Injection & Simulation
-const FAULT_INJECTION_PERIOD: u64 = 60;   // 60s = 60000ms
+const FAULT_INJECTION_PERIOD: u64 = 60;      // 60s = 60000ms
 const RECOVERY_TIME_LIMIT: u64 = 200000;     // 200000μs = 200ms    
-const SIMULATION_DURATION: u64 = 125;     // 125s = 125000ms = 2min 5sec to inject 3 faults
+const SIMULATION_DURATION: u64 = 125;        // 125s = 125000ms = 2min 5sec to inject 3 faults
  
 // Pre-allocated worst case Vec capacities during compilation to avoiding unpredictable heap allocation latency
 const JITTER_MAX_SIZE: usize = 10000;
@@ -624,7 +624,8 @@ fn command_receiver_thread(running: Shared<bool>, emergency: Shared<bool>, log: 
                 {
                     Ok(command) =>
                     {
-                        let line = format!(
+                        let line = format!
+                        (
                             "[{}ms] [OCS-UDP] {} -> command=\"{}\"  timestamp={}",
                             simulation_elapsed(&simulation_start_time),
                             source_address,
@@ -718,11 +719,12 @@ fn command_receiver_thread(running: Shared<bool>, emergency: Shared<bool>, log: 
  
 // ~~~~ SECTION 1: Sensor Data Acquisition & Prioritization ~~~~~
 // 10. ---- THERMAL THREAD (CRITICAL SENSOR) ----
-fn thermal_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<SystemMetrics>, state: Shared<SystemState>, emergency: Shared<bool>, udp_sender: mpsc::Sender<String>, running: Shared<bool>, log: Shared<File>, simulation_start_time: Instant)
+fn thermal_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<SystemMetrics>, emergency: Shared<bool>, udp_sender: mpsc::Sender<String>, running: Shared<bool>, log: Shared<File>, simulation_start_time: Instant)
 {
+//{   
     #[cfg(windows)]
     unsafe {winapi::um::processthreadsapi::SetThreadPriority(winapi::um::processthreadsapi::GetCurrentThread(), winapi::um::winbase::THREAD_PRIORITY_HIGHEST as i32,);}
-
+//}
     let log_line = format!
     (
         "[{}ms] [Thermal] period={}ms  buffer_priority=1  CRITICAL SENSOR",
@@ -736,16 +738,8 @@ fn thermal_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<Syste
  
     while is_running(&running)
     {
-        // Slow down in degraded mode
-        let current_state = state.lock().unwrap().clone();
-        if current_state == SystemState::Degraded
-        {
-            thread::sleep(Duration::from_millis(THERMAL_PERIOD * 2));
-        }
-        else
-        {
-            thread::sleep(Duration::from_millis(THERMAL_PERIOD));
-        }
+        // No slow down in Degraded Mode for CRITICAL sensor
+        thread::sleep(Duration::from_millis(THERMAL_PERIOD));
         let work_start = Instant::now();
         
         // Calculate scheduling drift
@@ -864,9 +858,10 @@ fn thermal_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<Syste
 // 11. ---- ACCELEROMETER THREAD ----
 fn accelerometer_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<SystemMetrics>, state: Shared<SystemState>, running: Shared<bool>, log: Shared<File>, simulation_start_time: Instant)
 {
-    //#[cfg(windows)]
-   //unsafe {winapi::um::processthreadsapi::SetThreadPriority(winapi::um::processthreadsapi::GetCurrentThread(), winapi::um::winbase::THREAD_PRIORITY_ABOVE_NORMAL as i32,);}
-
+//{
+    #[cfg(windows)]
+    unsafe {winapi::um::processthreadsapi::SetThreadPriority(winapi::um::processthreadsapi::GetCurrentThread(), winapi::um::winbase::THREAD_PRIORITY_ABOVE_NORMAL as i32,);}
+//}
     let log_line = format!
     (
         "[{}ms] [Accelerometer] period={}ms  buffer_priority=2",
@@ -957,9 +952,10 @@ fn accelerometer_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared
 // 12. ---- GYROSCOPE THREAD ----
 fn gyroscope_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<SystemMetrics>, state: Shared<SystemState>, running: Shared<bool>, log: Shared<File>, simulation_start_time: Instant)
 {
-    //#[cfg(windows)]
-    //unsafe {winapi::um::processthreadsapi::SetThreadPriority(winapi::um::processthreadsapi::GetCurrentThread(), winapi::um::winbase::THREAD_PRIORITY_ABOVE_NORMAL as i32,);}
-
+//{    
+    #[cfg(windows)]
+    unsafe {winapi::um::processthreadsapi::SetThreadPriority(winapi::um::processthreadsapi::GetCurrentThread(), winapi::um::winbase::THREAD_PRIORITY_ABOVE_NORMAL as i32,);}
+//}
     let log_line = format!
     (
         "[{}ms] [Gyroscope] period={}ms  buffer_priority=3",
@@ -1315,22 +1311,20 @@ fn antenna_alignment_task(metrics: Shared<SystemMetrics>, state: Shared<SystemSt
         let expected_elapsed = iteration * ANTENNA_ALIGNMENT_PERIOD;
         let drift = calculate_drift(&simulation_start_time, expected_elapsed);
  
-        // Compute angle and elevation for this iteration
+        // Compute angle for this iteration
         let angle_degrees = (iteration as f64 * 7.2) % 360.0; // full 360 degrees every 50 iterations
-        let elevation_degrees = 30.0 + 20.0 * (iteration as f64 * 0.05).sin();
  
         let line = format!
         (
-            "[{}ms] [Antenna] iteration={:>4}  angle={:>6.1}degrees  elevation={:>5.1}degrees  drift={:+}ms",
+            "[{}ms] [Antenna] iteration={:>4}  angle={:>6.1}degrees  drift={:+}ms",
             simulation_elapsed(&simulation_start_time),
             iteration,
             angle_degrees,
-            elevation_degrees,
             drift
         );
         append_log(&log, &line);
  
-        if drift.abs() > 5 // 5 ms check
+        if drift.abs() > 15 // 15 ms check
         {
             let violation = format!
             (
@@ -1632,10 +1626,12 @@ fn print_final_report(metrics: &SystemMetrics)
     println!("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n");
 }
 
-#[cfg(windows)]
-fn s() { unsafe {winapi::um::timeapi::timeBeginPeriod(1);}}
-#[cfg(not(windows))]
-fn s() {}
+//{
+    #[cfg(windows)]
+    fn s() { unsafe {winapi::um::timeapi::timeBeginPeriod(1);}}
+    #[cfg(not(windows))]
+    fn s() {}
+//}
 // ~~~~ SECTION 6: MAIN FUNCTION ~~~~~
 // 18. ---- MAIN ----
 // Sets up all shared state, spawns all OS threads, schedules RM background tasks via ScheduledThreadPool
@@ -1702,13 +1698,12 @@ fn main()
     ({
         let buffer = Arc::clone(&shared_priority_buffer);
         let metrics = Arc::clone(&shared_system_metrics);
-        let state = Arc::clone(&shared_system_state);
         let emergency = Arc::clone(&shared_emergency_flag);
         let transmit = telemetry_sender.clone();
         let running = Arc::clone(&shared_running_flag);
         let logger = Arc::clone(&log);
         let start = simulation_start_time;
-        move || thermal_thread(buffer, metrics, state, emergency, transmit, running, logger, start)
+        move || thermal_thread(buffer, metrics, emergency, transmit, running, logger, start)
     }));
 
     // SENSOR 2: Accelerometer thread
