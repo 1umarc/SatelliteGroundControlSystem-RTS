@@ -9,7 +9,7 @@ use std::marker::PhantomData;       // for typestate
 use std::net::UdpSocket;            // for UDP
 use std::sync::{Arc, Mutex};        // for shared ownership across threads 
 use std::sync::mpsc;                // for message passing between threads
-use std::thread;                    // for OS thread creation (Hard RTS)
+use std::thread;                    // for OS thread creation (Hard RTOS)
 use std::time::{Duration, Instant}; // for timing
 
 // Other Imports
@@ -721,10 +721,6 @@ fn command_receiver_thread(running: Shared<bool>, emergency: Shared<bool>, log: 
 // 10. ---- THERMAL THREAD (CRITICAL SENSOR) ----
 fn thermal_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<SystemMetrics>, emergency: Shared<bool>, udp_sender: mpsc::Sender<String>, running: Shared<bool>, log: Shared<File>, simulation_start_time: Instant)
 {
-//{   
-    #[cfg(windows)]
-    unsafe {winapi::um::processthreadsapi::SetThreadPriority(winapi::um::processthreadsapi::GetCurrentThread(), winapi::um::winbase::THREAD_PRIORITY_HIGHEST as i32,);}
-//}
     let log_line = format!
     (
         "[{}ms] [Thermal] period={}ms  buffer_priority=1  CRITICAL SENSOR",
@@ -858,10 +854,6 @@ fn thermal_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<Syste
 // 11. ---- ACCELEROMETER THREAD ----
 fn accelerometer_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<SystemMetrics>, state: Shared<SystemState>, running: Shared<bool>, log: Shared<File>, simulation_start_time: Instant)
 {
-//{
-    #[cfg(windows)]
-    unsafe {winapi::um::processthreadsapi::SetThreadPriority(winapi::um::processthreadsapi::GetCurrentThread(), winapi::um::winbase::THREAD_PRIORITY_ABOVE_NORMAL as i32,);}
-//}
     let log_line = format!
     (
         "[{}ms] [Accelerometer] period={}ms  buffer_priority=2",
@@ -952,10 +944,6 @@ fn accelerometer_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared
 // 12. ---- GYROSCOPE THREAD ----
 fn gyroscope_thread(priority_buffer: Shared<PriorityBuffer>, metrics: Shared<SystemMetrics>, state: Shared<SystemState>, running: Shared<bool>, log: Shared<File>, simulation_start_time: Instant)
 {
-//{    
-    #[cfg(windows)]
-    unsafe {winapi::um::processthreadsapi::SetThreadPriority(winapi::um::processthreadsapi::GetCurrentThread(), winapi::um::winbase::THREAD_PRIORITY_ABOVE_NORMAL as i32,);}
-//}
     let log_line = format!
     (
         "[{}ms] [Gyroscope] period={}ms  buffer_priority=3",
@@ -1626,19 +1614,13 @@ fn print_final_report(metrics: &SystemMetrics)
     println!("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n");
 }
 
-//{
-    #[cfg(windows)]
-    fn s() { unsafe {winapi::um::timeapi::timeBeginPeriod(1);}}
-    #[cfg(not(windows))]
-    fn s() {}
-//}
+
 // ~~~~ SECTION 6: MAIN FUNCTION ~~~~~
 // 18. ---- MAIN ----
 // Sets up all shared state, spawns all OS threads, schedules RM background tasks via ScheduledThreadPool
 // In the end, shuts everything down gracefully and prints final benchmarking report
 fn main()
 {
-    s();
     println!("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~");
     println!("|  SATELLITE ONBOARD CONTROL SYSTEM (OCS) - BY LUVEN MARK (TP071542) |");
     println!("|  TYPE: HARD RTOS, demonstrating the learnt Hard RTS concepts.      |");

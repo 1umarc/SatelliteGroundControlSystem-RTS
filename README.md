@@ -2,8 +2,8 @@
 
 This project is a **Rust-based real-time system simulation**, consisting of two separate components:
 
-* **OCS (SATELLITE ONBOARD CONTROL SYSTEM)** – BY LUVEN MARK (TP071542)
-* **GCS (GROUND CONTROL STATION)** – BY CHONG CHUN KIT (TP077436)
+* [HARD RTOS] **OCS (SATELLITE ONBOARD CONTROL SYSTEM)** – BY LUVEN MARK (TP071542)
+* [SOFT RTS]  **GCS (GROUND CONTROL STATION)** – BY CHONG CHUN KIT (TP077436)
 
 Both systems run independently and communicate during the simulation.
 
