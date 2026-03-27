@@ -33,14 +33,12 @@ const FAULT_RESPONSE_LIMIT: u64 = 100;  // interlock must engage within 100ms of
 
 // Loss of contact threshold
 const LOSS_OF_CONTACT_MISS_THRESHOLD: u32 = 3;
-// if we miss 3 or more packets in a row, we declare loss of contact
 
 const REREQUEST_INTERVAL: u64 = 500;
-// check for silence every 500ms — quick enough to notice, not so fast we spam requests
+// check for silence every 500ms 
 
 // Jitter warning limit in microseconds
 const UPLINK_JITTER_LIMIT: i64 = 3000;
-// 3000µs = 3ms, similar to the dispatch deadline (additional)
 
 // How long the whole simulation runs
 const SIMULATION_DURATION: u64 = 125;  // 2.08 minutes, same as OCS
@@ -51,21 +49,10 @@ const OCS_COMMAND_ADDRESS: &str = "127.0.0.1:9001";  // GCS sends commands to OC
 
 // Log file name
 const LOG_FILE: &str = "gcs.log"; 
-// all the detailed per-packet events go here so the terminal doesn't get too noisy
 
 // ===============
 // Messages that the OCS sends to us over UDP.
-// Each variant maps to one type of telemetry or alert.
-// Field names must exactly match what the OCS serialises —
-// serde_json silently fails to parse any packet where a name differs.
-//
-// The OCS enum has only #[derive(Serialize, Deserialize, Debug)] with NO serde tag attribute.
-// That means it uses Rust's default externally-tagged format, which looks like:
-//   {"Thermal":{"sequence":1,"temperature":36.5,"drift":2}}
-//   {"Alert":{"event":"fault","misses":null,"count":1,"fault_type":"CorruptedReading"}}
-// This GCS enum must match that format exactly — no #[serde(tag)] here.
-// CHANGED: removed #[serde(tag = "tag", rename_all = "snake_case")] — that format
-//          does NOT match what the OCS sends and caused every packet to fail parsing.
+// ===============
 #[derive(Serialize, Deserialize, Debug)]
 enum OCSMessage 
 {
@@ -86,7 +73,6 @@ enum OCSMessage
         payload: String,
     },
 
-    // CHANGED: Alert fields are now inline to match the OCS wire format exactly.
     // OCS sends misses/count/fault_type as direct fields, not nested in a struct.
     Alert
     {
@@ -142,7 +128,6 @@ impl GCSMode<Normal>
 }
 
 // GCSMode<Normal> to call this function, which can only be constructed after
-// confirming fault_active is false at runtime.
 fn dispatch_command(normal_mode: &GCSMode<Normal>, command_sender: &mpsc::Sender<UplinkCommand>, payload: String)
 {
     let _ = normal_mode;  // used only for the compile-time type check — no runtime cost
@@ -335,7 +320,7 @@ fn create_logger() -> Shared<File>
     let log_file = OpenOptions::new()
         .create(true)
         .write(true)
-        .truncate(true)  // start fresh each run
+        .truncate(true)  
         .open(LOG_FILE)
         .expect("[LOG] Failed to create log file");
 
@@ -371,7 +356,7 @@ simulation_start: Instant, shutdown: CancellationToken)
             {
                 match result
                 {
-                    Ok((len, sender_address)) => // CHANGED: was 'from' which is a reserved-feeling short name — renamed to sender_address
+                    Ok((len, sender_address)) => 
                     {
                         // Stamp the arrival time right away, before any processing
                         let received_at = Instant::now();
@@ -386,7 +371,7 @@ simulation_start: Instant, shutdown: CancellationToken)
                         else
                         {
                             // Channel is full — we had to drop this packet
-                            print_and_log(&logger, &format!("[{}ms] [UDP Receiver] Channel full — packet dropped from {sender_address}", simulation_elapsed(&simulation_start))); // CHANGED: updated to use sender_address
+                            print_and_log(&logger, &format!("[{}ms] [UDP Receiver] Channel full — packet dropped from {sender_address}", simulation_elapsed(&simulation_start))); 
                         }
                     }
                     Err(error) => print_and_log(&logger, &format!("[{}ms] [UDP Receiver] recv_from error: {error}", simulation_elapsed(&simulation_start)))
@@ -462,9 +447,6 @@ shutdown: CancellationToken)
 // Part 1 — Telemetry Processor
 // Decodes incoming packets and routes them to the correct state update
 // ===============
-
-// This is the synchronous decode function — called inside spawn_blocking
-// so it doesn't hold up the async runtime while parsing JSON
 fn decode_packet_sync(payload: String) -> Result<OCSMessage, String>
 {
     serde_json::from_str::<OCSMessage>(&payload)
@@ -542,7 +524,6 @@ async fn telemetry_processor_task(mut receiver: mpsc::Receiver<IncomingPacket>, 
                 last_received_at = Some(Instant::now());
  
                 // Route each message type to the right handler
-                // Route each message type to the right handler
                 match &message
                 {
                     // =============
@@ -556,8 +537,6 @@ async fn telemetry_processor_task(mut receiver: mpsc::Receiver<IncomingPacket>, 
 
                     // =============
                     // Status Message
-                    // Receiving Status means the satellite is alive —
-                    // reset the thermal watchdog so it doesn't false-fire.
                     // =============
                     OCSMessage::Status {iteration, fill, state: system_state, drift} =>
                     {
@@ -583,9 +562,6 @@ async fn telemetry_processor_task(mut receiver: mpsc::Receiver<IncomingPacket>, 
 
                     // =============
                     // Downlink Message
-                    // The OCS bundles all sensor readings into one compressed packet.
-                    // We unpack each reading here and update state just like the old
-                    // individual Thermal/Accelerometer/Gyroscope messages used to.
                     // =============
                     OCSMessage::Downlink { packet_id, reading_count, bytes, queue_latency, payload } =>
                     {
@@ -667,7 +643,7 @@ fn handle_ocs_alert(message: &OCSMessage, state: &Shared<GCSState>, metrics: &Sh
     // Pull the event string out of the Alert variant
     let event = match message
     {
-        OCSMessage::Alert {event, ..} => event.as_str(), // CHANGED: removed TODO comment
+        OCSMessage::Alert {event, ..} => event.as_str(), 
         _ => return,
     };
 
@@ -913,9 +889,6 @@ async fn fault_manager_task(state: Shared<GCSState>, metrics: Shared<GCSMetrics>
 // ===============
 // Part 2 — Command Uplink Tasks
 // Three Rate Monotonic tasks that periodically send check commands to the OCS.
-// RM scheduling: shortest period = highest priority.
-// The GCS command periods are 2x the OCS sensor periods —
-// fast enough to monitor health without flooding the uplink.
 // ===============
 
 // Thermal Check — RM Priority 1 (fastest period = highest priority)
@@ -924,8 +897,8 @@ async fn thermal_command_task(command_sender: mpsc::Sender<UplinkCommand>, state
     write_log(&logger, &format!("[{}ms] [Thermal Command] Started.  period={}ms  RM-P1", simulation_elapsed(&simulation_start), THERMAL_COMMAND_PERIOD));
 
     let mut iteration: u64 = 0;
-    let task_start: Instant = Instant::now();    // reference point for drift calculation
-    let mut last_tick: Instant = Instant::now(); // reference point for jitter calculation
+    let task_start: Instant = Instant::now();    
+    let mut last_tick: Instant = Instant::now(); 
 
     loop
     {
@@ -964,7 +937,6 @@ async fn thermal_command_task(command_sender: mpsc::Sender<UplinkCommand>, state
 
         // Typestate guard — can only construct GCSMode<Normal> when fault_active is false.
         // dispatch_command requires &GCSMode<Normal>, so this is compile-time proof
-        // that the interlock was checked before dispatching.
         let normal_mode = GCSMode::<Normal>::new();
 
         let payload = encode_command(&GCSCommand
@@ -1055,8 +1027,7 @@ async fn accelerometer_command_task(command_sender: mpsc::Sender<UplinkCommand>,
 
         dispatch_command(&normal_mode, &command_sender, payload); // RM-P2
 
-        // FIX: jitter warning was missing from Accelerometer — added to match Thermal and Gyroscope.
-        // Without this, any jitter spike here is silently dropped and never reaches the final benchmarking report.
+        // jitter warning was missing from Accelerometer — added to match Thermal and Gyroscope.
         if jitter_timing > UPLINK_JITTER_LIMIT
         {
             let warning = format!("[{}ms] [WARN] Accelerometer Command jitter {}µs iteration={iteration}", simulation_elapsed(&simulation_start), jitter_timing);
